@@ -1,0 +1,45 @@
+{
+  "include": [
+    "app"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/node_modules",
+    "**/.*"
+  ],
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "warning",
+  "reportMissingModuleSource": "warning",
+  "reportUnusedImport": "warning",
+  "reportUnusedClass": "warning",
+  "reportUnusedFunction": "warning",
+  "reportUnusedVariable": "warning",
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "standard",
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonPlatform": "Darwin",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "pythonVersion": "3.14",
+      "pythonPlatform": "Darwin",
+      "extraPaths": [
+        ".venv/lib/python3.14/site-packages",
+        "stubs"
+      ]
+    }
+  ],
+  "ignore": [
+    "**/node_modules",
+    "**/__pycache__",
+    "stubs/**"
+  ],
+  "reportGeneralTypeIssues": "warning",
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalSubscript": "warning",
+  "reportPrivateImportUsage": "warning",
+  "reportMissingTypeStubs": "warning",
+  "stubPath": ".venv/lib/python3.14/site-packages"
+}
+

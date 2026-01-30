@@ -1,0 +1,5 @@
+[MASTER]
+ignore=numpy,flet
+
+[MESSAGES CONTROL]
+disable=import-error,no-member

@@ -1,0 +1,71 @@
+# Cursor Rules for English Skill App Project
+
+## Markdownファイルの保存場所
+
+**重要**: Cursorが自動的に作成するMarkdownファイル（レポート、メモ、ドキュメントなど）は、すべて`.cursor_memo/`ディレクトリ以下に保存してください。
+
+- プロジェクトのトップディレクトリには`README.md`のみを配置します
+- その他のMarkdownファイル（仕様書、トラブルシューティング、テスト結果、コードレビュー、実装メモなど）は全て`.cursor_memo/`に保存します
+- 既存のMarkdownファイルを移動する場合は、`README.md`内の参照リンクも更新してください
+
+### 例
+
+✅ **正しい**:
+- `.cursor_memo/specifications.md`
+- `.cursor_memo/TROUBLESHOOTING.md`
+- `.cursor_memo/TEST_RESULTS.md`
+- `.cursor_memo/CODE_REVIEW.md`
+
+❌ **間違い**:
+- `specifications.md` (プロジェクトルート)
+- `TROUBLESHOOTING.md` (プロジェクトルート)
+- `docs/specifications.md` (別のディレクトリ)
+
+## プロジェクト構造
+
+このプロジェクトは以下の構造を維持します：
+
+```
+english_skill3/
+├── README.md              # プロジェクトのメインドキュメント（ルートのみ）
+├── .cursor_memo/          # Cursorが作成するMarkdownファイルの保存場所
+│   ├── specifications.md
+│   ├── TROUBLESHOOTING.md
+│   └── ... (その他のMarkdownファイル)
+├── app/                   # アプリケーションコード
+├── tests/                 # テストコード
+└── ... (その他のファイル)
+```
+
+## その他のルール
+
+- 日本語での出力は「だ・である」調を使用（敬語ではない）
+- バックエンドはFastAPIを使用（Webアプリケーションの場合）
+- Dockerは`docker compose`コマンドを使用（`docker-compose`ではない）
+- プロジェクト作成時は`specifications.md`を`.cursor_memo/`に作成し、再現に必要な情報を含める
+
+## 型チェックとリンター
+
+**重要**: 型スタブの問題によるリンター警告を許容しない。以下の対応を徹底する：
+
+1. **型スタブパッケージの使用**
+   - 利用可能な型スタブパッケージ（`types-*`、`*-stubs`）は必ずインストールする
+   - `pyproject.toml`の`dev`依存関係に追加する
+
+2. **型アノテーションの改善**
+   - `type: ignore`コメントは可能な限り避ける
+   - numpy配列には`numpy.typing.NDArray`を使用する
+   - 適切な型アノテーションを追加して型推論を改善する
+
+3. **カスタム型スタブの作成**
+   - 公式の型スタブが存在しないライブラリ（flet、sounddeviceなど）には、カスタム型スタブファイル（`.pyi`）を作成する
+   - `stubs/`ディレクトリに配置し、`pyrightconfig.json`の`extraPaths`に追加する
+
+4. **型チェック設定の強化**
+   - `pyrightconfig.json`で`reportMissingTypeStubs: "warning"`を有効化する
+   - `typeCheckingMode: "standard"`以上を使用する
+   - 警告を無効化するのではなく、問題を解決する
+
+5. **リンター警告の対応**
+   - 「型スタブの問題で、動作には影響しません」という言い訳は許容しない
+   - すべてのリンター警告に対応し、警告を0にすることを目指す
