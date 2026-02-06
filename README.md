@@ -6,7 +6,7 @@
 
 ## 概要
 
-英会話能力を測定するためのデスクトップアプリケーションです。OpenAI Realtime API、GPT-5シリーズ、Azure Pronunciation Assessmentを活用して、リアルタイムで英会話能力を評価します。
+英会話能力を測定するためのデスクトップアプリケーションです。OpenAI Realtime API、GPT-5シリーズを活用して、リアルタイムで英会話能力を評価します。
 
 ### 主な機能
 
@@ -22,10 +22,10 @@
 
 - **開発環境**: macOS / Windows
 - **配布プラットフォーム**: Windows（PyInstallerで実行ファイル化）
-- **言語**: Python 3.14
+- **言語**: Python 3.14.2
 - **GUIフレームワーク**: Flet（FlutterベースのクロスプラットフォームGUI）
 - **パッケージング**: PyInstaller（Windows実行ファイルとして配布可能）
-- **API**: OpenAI Realtime API, GPT-5, Azure Pronunciation Assessment
+- **API**: OpenAI Realtime API, GPT-5, GPT-4o-mini-tts
 - **データ保存**: ローカルファイル（ユーザー認証不要）
 
 ## セットアップ
@@ -66,17 +66,14 @@ uv sync
 
 **必要な環境変数**：
 - `OPENAI_API_KEY` または `OPENAI_API`: OpenAI APIキー（Realtime APIと評価機能で使用）
-- `AZURE_SPEECH_KEY`: Azure Speech Serviceキー（発音評価で使用、オプション）
-- `AZURE_SPEECH_REGION`: Azure Speech Serviceリージョン（例：`japaneast`、オプション）
-
+- `OPENROUTER_API_KEY`
 `.env`ファイルの例：
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
-AZURE_SPEECH_KEY=your_azure_speech_key_here
-AZURE_SPEECH_REGION=japaneast
+OPENROUTER_API_KEY=your_openroutor_api_key_here
 ```
 
-**注意**: `OPENAI_API_KEY`は必須です。Azure Speech Serviceの環境変数は、発音評価機能を使用する場合のみ必要です。
+**注意**: `OPENAI_API_KEY`は必須です。
 
 ### 実行方法
 
@@ -137,12 +134,12 @@ uv run pytest tests/test_imports.py
 アプリケーションは以下のタブで構成されています：
 
 1. **メイン画面タブ**
-   - API接続状態の確認（OpenAI API、Azure Speech Service）
+   - API接続状態の確認（OpenAI API，Openroutor API）
    - マイク・スピーカーのテスト機能
    - リアルタイム音声波形の表示
    - テストデータの初期化機能
 
-2. **発音テストタブ**（開発中）
+2. **発音テストタブ**（開発中止）
    - 単語や文章の発音を評価します
    - Azure Pronunciation Assessmentを使用した発音評価機能を予定
 
@@ -156,7 +153,7 @@ uv run pytest tests/test_imports.py
    - 聞き取り能力を評価します
    - 音声を聞いて理解度を測定する機能を予定
 
-5. **文法テストタブ**（開発中）
+5. **文法テストタブ**（開発中止）
    - 文法の正確性を評価します
    - 文法問題への回答を評価する機能を予定
 
