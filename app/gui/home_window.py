@@ -52,7 +52,7 @@ class HomeWindow:
             size=32,
             weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
-            color=ft.Colors.BLACK
+            color=ft.colors.BLACK
         )
         
         # 説明文
@@ -61,7 +61,7 @@ class HomeWindow:
             "発音、文法、流暢さなど、総合的な評価を提供します。",
             size=16,
             text_align=ft.TextAlign.CENTER,
-            color=ft.Colors.BLACK
+            color=ft.colors.BLACK
         )
         
         # マイクとスピーカーのチェックセクション
@@ -120,15 +120,15 @@ class HomeWindow:
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.BLUE,
-                    below_line_bgcolor=ft.Colors.BLUE_100,
+                    color=ft.colors.BLUE,
+                    below_line_bgcolor=ft.colors.BLUE_100,
                 )
             ],
             border=ft.border.Border(
-                bottom=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
-                left=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
-                top=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
-                right=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
+                bottom=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
+                left=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
+                top=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
+                right=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
             ),
             left_axis=ft.ChartAxis(
                 labels_size=40,
@@ -136,7 +136,7 @@ class HomeWindow:
             bottom_axis=ft.ChartAxis(
                 labels_size=40,
             ),
-            tooltip_bgcolor=ft.Colors.with_opacity(0.8, ft.Colors.BLUE_GREY),
+            tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
             min_y=0.0,
             max_y=1.0,
             min_x=0,
@@ -151,15 +151,15 @@ class HomeWindow:
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.GREEN,
-                    below_line_bgcolor=ft.Colors.GREEN_100,
+                    color=ft.colors.GREEN,
+                    below_line_bgcolor=ft.colors.GREEN_100,
                 )
             ],
             border=ft.border.Border(
-                bottom=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
-                left=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
-                top=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
-                right=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
+                bottom=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
+                left=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
+                top=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
+                right=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
             ),
             left_axis=ft.ChartAxis(
                 labels_size=40,
@@ -167,7 +167,7 @@ class HomeWindow:
             bottom_axis=ft.ChartAxis(
                 labels_size=40,
             ),
-            tooltip_bgcolor=ft.Colors.with_opacity(0.8, ft.Colors.BLUE_GREY),
+            tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
             min_y=0.0,
             max_y=1.0,
             min_x=0,
@@ -188,7 +188,7 @@ class HomeWindow:
         self.status_text = ft.Text(
             "ボタンをクリックして「Hello」と発話してください",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             text_align=ft.TextAlign.CENTER
         )
         
@@ -200,14 +200,14 @@ class HomeWindow:
                         size=20,
                         weight=ft.FontWeight.BOLD,
                         text_align=ft.TextAlign.CENTER,
-                        color=ft.Colors.BLACK
+                        color=ft.colors.BLACK
                     ),
                     ft.Container(height=10),
                     ft.Row(
                         [
                             ft.Column(
                                 [
-                                    ft.Text("マイク", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
+                                    ft.Text("マイク", size=16, weight=ft.FontWeight.BOLD, color=ft.colors.BLACK),
                                     self.mic_chart,
                                 ],
                                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -215,7 +215,7 @@ class HomeWindow:
                             ft.Container(width=20),
                             ft.Column(
                                 [
-                                    ft.Text("スピーカー", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK),
+                                    ft.Text("スピーカー", size=16, weight=ft.FontWeight.BOLD, color=ft.colors.BLACK),
                                     self.speaker_chart,
                                 ],
                                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -231,7 +231,7 @@ class HomeWindow:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=20,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=10,
         )
     
@@ -245,7 +245,7 @@ class HomeWindow:
             status_text = ft.Text(
                 f"{api_result['name']}の状態：{api_result['status']}",
                 size=14,
-                color=ft.Colors.BLACK
+                color=ft.colors.BLACK
             )
             self.api_status_texts[api_result['name']] = status_text
             api_status_widgets.append(status_text)
@@ -258,7 +258,7 @@ class HomeWindow:
                         size=20,
                         weight=ft.FontWeight.BOLD,
                         text_align=ft.TextAlign.CENTER,
-                        color=ft.Colors.BLACK
+                        color=ft.colors.BLACK
                     ),
                     ft.Container(height=10),
                     *api_status_widgets,
@@ -266,7 +266,7 @@ class HomeWindow:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=20,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=10,
         )
     
@@ -284,7 +284,7 @@ class HomeWindow:
                 self.is_recording = True
                 if self.status_text:
                     self.status_text.value = "録音中...「Hello」と発話してください（3秒間）"
-                    self.status_text.color = ft.Colors.BLUE
+                    self.status_text.color = ft.colors.BLUE
                 if self.test_button:
                     self.test_button.disabled = True
                 self.page.update()
@@ -299,7 +299,7 @@ class HomeWindow:
                     
                     if self.status_text:
                         self.status_text.value = "再生中..."
-                        self.status_text.color = ft.Colors.GREEN
+                        self.status_text.color = ft.colors.GREEN
                     self.page.update()
                     
                     # 再生（音量ゲイン10倍で再生）
@@ -314,11 +314,11 @@ class HomeWindow:
                     
                     if self.status_text:
                         self.status_text.value = "テスト完了！マイクとスピーカーが正常に動作しています。"
-                        self.status_text.color = ft.Colors.GREEN
+                        self.status_text.color = ft.colors.GREEN
                 else:
                     if self.status_text:
                         self.status_text.value = "録音に失敗しました。マイクの接続を確認してください。"
-                        self.status_text.color = ft.Colors.RED
+                        self.status_text.color = ft.colors.RED
                 
                 if self.test_button:
                     self.test_button.disabled = False
@@ -328,7 +328,7 @@ class HomeWindow:
                 print(f"テストエラー: {str(ex)}")
                 if self.status_text:
                     self.status_text.value = f"エラーが発生しました: {str(ex)}"
-                    self.status_text.color = ft.Colors.RED
+                    self.status_text.color = ft.colors.RED
                 if self.test_button:
                     self.test_button.disabled = False
                 self.page.update()
@@ -472,11 +472,11 @@ class HomeWindow:
                 
                 # 状態に応じて色を変更
                 if api_result['status'] == "利用可能":
-                    status_text.color = ft.Colors.GREEN
+                    status_text.color = ft.colors.GREEN
                 elif api_result['status'] == "エラー":
-                    status_text.color = ft.Colors.RED
+                    status_text.color = ft.colors.RED
                 else:
-                    status_text.color = ft.Colors.ORANGE
+                    status_text.color = ft.colors.ORANGE
         
         self.page.update()
     

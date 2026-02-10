@@ -58,21 +58,21 @@ class TestConversationWindow:
     def test_disable_other_tabs(self, conversation_window):
         """他のタブを無効化するテスト"""
         conversation_window.tabs = Mock()
-        conversation_window.tabs.unselected_label_color = ft.Colors.BLACK
+        conversation_window.tabs.unselected_label_color = ft.colors.BLACK
         
         conversation_window._disable_other_tabs("conversation")
         
-        assert conversation_window.tabs.unselected_label_color == ft.Colors.GREY_400
+        assert conversation_window.tabs.unselected_label_color == ft.colors.GREY_400
         assert conversation_window.page.update.called
     
     def test_enable_all_tabs(self, conversation_window):
         """すべてのタブを有効化するテスト"""
         conversation_window.tabs = Mock()
-        conversation_window.tabs.unselected_label_color = ft.Colors.GREY_400
+        conversation_window.tabs.unselected_label_color = ft.colors.GREY_400
         
         conversation_window._enable_all_tabs()
         
-        assert conversation_window.tabs.unselected_label_color == ft.Colors.BLACK
+        assert conversation_window.tabs.unselected_label_color == ft.colors.BLACK
         assert conversation_window.page.update.called
     
     def test_on_tab_changed_main(self, conversation_window):

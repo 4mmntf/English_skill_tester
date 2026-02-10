@@ -17,6 +17,8 @@ dependencies = [
     "pydub>=0.25.1",
     "audioop-lts>=0.2.2",  # Python 3.13+でaudioopの代替として必要
     "aiofiles>=23.2.0",  # 非同期ファイルI/O
+    "duckduckgo-search>=8.1.1",
+    "scipy>=1.17.0",
 ]
 
 [project.optional-dependencies]

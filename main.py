@@ -48,7 +48,7 @@ class App:
         self.page.window_min_width = 1200  # 最小幅も設定
         self.page.window_min_height = 800   # 最小高さも設定
         self.page.theme_mode = ft.ThemeMode.LIGHT
-        self.page.bgcolor = ft.Colors.WHITE
+        self.page.bgcolor = ft.colors.WHITE
         
         # アプリケーションデータディレクトリの作成
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)

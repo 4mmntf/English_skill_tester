@@ -11,11 +11,11 @@
 ### 主な機能
 
 - **リアルタイム英会話**: OpenAI Realtime APIを使用したAI講師とのリアルタイム音声対話
-- **複数のテスト項目**: 発音テスト、会話テスト、リスニングテスト、文法テスト
+- **複数のテスト項目**: 会話テスト、リスニングテスト（予定）
 - **自動評価機能**: 会話内容を自動的に分析し、文法・語彙・表現・流暢さを評価
 - **ロールプレイ機能**: レストラン、ホテル、空港など様々なシーンでの会話練習
 - **音声デバイステスト**: マイク・スピーカーの動作確認とリアルタイム波形表示
-- **API状態確認**: OpenAI API、Azure Speech Serviceの接続状態を確認
+- **API状態確認**: OpenAI APIの接続状態を確認
 - **データ自動保存**: 評価データはローカルファイルに自動保存（ユーザー認証不要）
 
 ## 技術スタック
@@ -25,7 +25,7 @@
 - **言語**: Python 3.14.2
 - **GUIフレームワーク**: Flet（FlutterベースのクロスプラットフォームGUI）
 - **パッケージング**: PyInstaller（Windows実行ファイルとして配布可能）
-- **API**: OpenAI Realtime API, GPT-5, GPT-4o-mini-tts
+- **API**: OpenAI Realtime API, GPT-5
 - **データ保存**: ローカルファイル（ユーザー認証不要）
 
 ## セットアップ
@@ -66,11 +66,12 @@ uv sync
 
 **必要な環境変数**：
 - `OPENAI_API_KEY` または `OPENAI_API`: OpenAI APIキー（Realtime APIと評価機能で使用）
-- `OPENROUTER_API_KEY`
+- `OPENROUTER_API_KEY`: OpenRouter APIキー（リスニングテストで使用）
+
 `.env`ファイルの例：
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
-OPENROUTER_API_KEY=your_openroutor_api_key_here
+OPENROUTER_API_KEY=your_openrouter_api_key_here
 ```
 
 **注意**: `OPENAI_API_KEY`は必須です。
@@ -134,28 +135,20 @@ uv run pytest tests/test_imports.py
 アプリケーションは以下のタブで構成されています：
 
 1. **メイン画面タブ**
-   - API接続状態の確認（OpenAI API，Openroutor API）
+   - API接続状態の確認（OpenAI API）
    - マイク・スピーカーのテスト機能
    - リアルタイム音声波形の表示
    - テストデータの初期化機能
 
-2. **発音テストタブ**（開発中止）
-   - 単語や文章の発音を評価します
-   - Azure Pronunciation Assessmentを使用した発音評価機能を予定
-
-3. **会話テストタブ**（実装済み）
+2. **会話テストタブ**（実装済み）
    - リアルタイム英会話の評価機能（詳細は後述）
    - OpenAI Realtime APIを使用したリアルタイム音声対話
    - ロールプレイ機能
    - 自動評価機能
 
-4. **リスニングテストタブ**（開発中）
+3. **リスニングテストタブ**（開発中）
    - 聞き取り能力を評価します
    - 音声を聞いて理解度を測定する機能を予定
-
-5. **文法テストタブ**（開発中止）
-   - 文法の正確性を評価します
-   - 文法問題への回答を評価する機能を予定
 
 ### メイン画面タブの使い方
 
@@ -276,12 +269,11 @@ english_skill3/
 │   │   ├── home_window.py     # ホーム画面（現在は未使用）
 │   │   ├── conversation_window.py  # メイン画面（タブベースのUI）
 │   │   ├── result_window.py   # 結果画面（開発中）
-│   │   └── history_window.py   # 履歴画面（開発中）
+│   │   ├── history_window.py   # 履歴画面（開発中）
 │   ├── services/              # サービス層
 │   │   ├── __init__.py
 │   │   ├── audio_service.py           # 音声録音・再生サービス
 │   │   ├── api_check_service.py        # API接続状態チェックサービス
-│   │   ├── azure_service.py            # Azure Speech Service連携
 │   │   ├── openai_service.py          # OpenAI API連携（評価用）
 │   │   ├── realtime_service.py        # OpenAI Realtime API連携
 │   │   ├── evaluation_service.py      # 会話評価サービス
@@ -323,9 +315,7 @@ english_skill3/
 
 ### 開発中機能
 
-- 🚧 **発音テストタブ**: Azure Pronunciation Assessmentを使用した発音評価機能
 - 🚧 **リスニングテストタブ**: 音声を聞いて理解度を測定する機能
-- 🚧 **文法テストタブ**: 文法問題への回答を評価する機能
 - 🚧 **結果画面**: 評価結果の詳細表示
 - 🚧 **履歴画面**: 過去の評価履歴一覧と詳細表示
 
@@ -359,7 +349,6 @@ uv add --dev <package-name>
 
 - **flet[all]**: GUIフレームワーク
 - **openai**: OpenAI APIクライアント
-- **azure-cognitiveservices-speech**: Azure Speech Service
 - **sounddevice**: 音声入出力
 - **numpy**: 数値計算
 - **pydub**: 音声処理
@@ -369,4 +358,3 @@ uv add --dev <package-name>
 ## ライセンス
 
 このプロジェクトは開発中です。
-

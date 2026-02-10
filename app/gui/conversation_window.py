@@ -9,6 +9,7 @@ import random
 import json
 import re
 import traceback
+from collections import deque
 from typing import Any
 from datetime import datetime
 from pathlib import Path
@@ -18,11 +19,14 @@ import sounddevice as sd
 import asyncio
 import aiofiles
 from pydub import AudioSegment
+import scipy.io.wavfile as wavfile
 from app.services.audio_service import AudioService
 from app.services.api_check_service import APICheckService
 from app.services.storage_service import LocalStorageService
 from app.services.realtime_service import RealtimeService
 from app.services.evaluation_service import EvaluationService
+from app.services.search_service import SearchService
+from app.gui.result_window import ResultWindow
 
 
 class ConversationWindow:
@@ -43,6 +47,10 @@ class ConversationWindow:
         self.storage_service = LocalStorageService()
         self.realtime_service: RealtimeService | None = None
         self.evaluation_service: EvaluationService = EvaluationService()
+        self.search_service: SearchService = SearchService()
+
+        # 現在のテストセッションの保存ディレクトリ（会話とリスニングで共有）
+        self.current_session_dir: Path | None = None
 
         # テスト項目の定義（メイン画面を最初に追加）
         self.test_items: list[dict[str, str]] = [
@@ -50,11 +58,6 @@ class ConversationWindow:
                 "id": "main",
                 "name": "メイン画面",
                 "description": "APIチェックとマイク・スピーカーのテスト",
-            },
-            {
-                "id": "pronunciation",
-                "name": "発音テスト",
-                "description": "単語や文章の発音を評価します",
             },
             {
                 "id": "conversation",
@@ -101,6 +104,24 @@ class ConversationWindow:
         self.tab_timers: dict[
             str, dict[str, Any]
         ] = {}  # test_id -> {start_time, running, text, thread, final_time}
+
+        # リスニングテスト用の状態変数
+        self.listening_problems: list[dict] = []  # 取得した問題リスト
+        self.current_listening_index: int = 0  # 現在の問題インデックス
+        self.listening_score: int = 0  # リスニングテストのスコア
+        self.listening_question_count: int = 0  # リスニングテストの問題数
+        self.listening_results: list[dict] = []  # リスニングテストの詳細結果
+        self.listening_test_completed: bool = (
+            False  # リスニングテストが完了したかどうか
+        )
+
+        # 文法テスト用の状態変数
+        self.grammar_problems: list[dict] = []  # 取得した問題リスト
+        self.current_grammar_index: int = 0  # 現在の問題インデックス
+        self.grammar_score: int = 0  # 文法テストのスコア
+        self.grammar_question_count: int = 0  # 文法テストの問題数
+        self.grammar_results: list[dict] = []  # 文法テストの詳細結果
+        self.grammar_test_completed: bool = False  # 文法テストが完了したかどうか
 
         # テスト状態
         self.test_initialized: bool = False  # テストが初期化済みかどうか
@@ -150,15 +171,28 @@ class ConversationWindow:
             threading.Lock()
         )  # バッファキューアクセス用ロック
         self.audio_threshold: float = (
-            0.002  # 音声検出の閾値（ノイズを除外しつつ、音声を確実に検出）
+            0.01  # 音声検出の閾値（0.002から0.01に上げて、雑音を除外）
         )
         self.audio_send_count: int = 0  # 音声送信回数（デバッグ用）
         self.last_audio_send_time: float = 0.0  # 最後に音声を送信した時刻（デバッグ用）
+
+        # VAD（音声活動検出）の状態管理
+        self.speech_active_state: bool = False  # 発話継続中フラグ
+        self.silence_chunk_count: int = 0  # 無音チャンクカウンタ
+        self.post_roll_limit: int = 20  # 発話終了後の余韻送信数（20チャンク ≈ 850ms）
+
+        # プレロールバッファ（発話頭欠け防止用）
+        # 24kHz, 1024 samples/chunk => 1 chunk ≈ 43ms
+        # 10 chunks ≈ 430ms のバッファを保持
+        self.audio_pre_buffer: deque = deque(maxlen=10)
 
         # 会話履歴の記録
         self.conversation_history: list[
             dict[str, str]
         ] = []  # 会話履歴 [{"role": "ai" or "student", "text": "..."}]
+        self.student_memos: list[
+            dict[str, str]
+        ] = []  # 学生の特徴メモ [{"category": "grammar", "note": "..."}]
         self.evaluation_mode: bool = (
             False  # 評価モード（評価依頼中の返答を評価結果として扱う）
         )
@@ -172,7 +206,7 @@ class ConversationWindow:
         self.evaluation_feedback_text: ft.Text = ft.Text(
             "",
             size=18,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             text_align=ft.TextAlign.CENTER,
             weight=ft.FontWeight.BOLD,
         )  # 評価スコアと講評を表示するテキスト（画面下）
@@ -196,6 +230,7 @@ class ConversationWindow:
         self.student_recording_stream: sd.InputStream | None = (
             None  # 学生音声録音ストリーム
         )
+        self.is_monitoring_audio: bool = False  # 音声監視中フラグ（スレッド制御用）
 
         # 保存場所の設定（デフォルトはDesktop）
         self.save_directory: Path = Path.home() / "Desktop"
@@ -206,6 +241,74 @@ class ConversationWindow:
         self.save_directory_button: ft.ElevatedButton | None = (
             None  # 保存場所選択ボタン
         )
+
+        # 無音検知タイマー
+        self.silence_timer: threading.Timer | None = None
+        self.silence_timeout_seconds: float = 15.0  # 15秒間無音なら質問を変える
+
+    def _show_evaluating_overlay(self, message: str) -> None:
+        """評価中のオーバーレイを表示（画面全体を覆って操作不能にする）"""
+
+        # オーバーレイ用のコンテナ作成
+        overlay = ft.Container(
+            content=ft.Column(
+                [
+                    ft.ProgressRing(width=60, height=60, stroke_width=4),
+                    ft.Container(height=20),
+                    ft.Text(
+                        message,
+                        size=24,
+                        weight=ft.FontWeight.BOLD,
+                        color=ft.colors.WHITE,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    ft.Container(height=10),
+                    ft.Text(
+                        "この処理には数分かかる場合があります...",
+                        size=16,
+                        color=ft.colors.WHITE70,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLACK),
+            alignment=ft.alignment.center,
+            expand=True,
+        )
+
+        # ページ全体をStackで覆うために、既存のコントロールを一旦クリアして再構成するのではなく、
+        # `page.overlay` を使用するのが最も簡単で効果的
+        # Fletの `page.overlay` は画面の最前面に表示される
+
+        # 参照を保存して後で削除できるようにする
+        self.loading_overlay = overlay
+        self.page.overlay.append(overlay)
+        self.page.update()
+
+    def _hide_evaluating_overlay(self) -> None:
+        """評価中のオーバーレイを非表示"""
+        if (
+            hasattr(self, "loading_overlay")
+            and self.loading_overlay in self.page.overlay
+        ):
+            self.page.overlay.remove(self.loading_overlay)
+            self.page.update()
+            # 参照を削除
+            del self.loading_overlay
+        elif self.page.overlay:
+            # フォールバック: loading_overlayが見つからないがoverlayがある場合
+            # 中身を確認してProgressRingが含まれていれば削除する（簡易的な判定）
+            for overlay in list(self.page.overlay):
+                if isinstance(overlay, ft.Container) and isinstance(
+                    overlay.content, ft.Column
+                ):
+                    if any(
+                        isinstance(c, ft.ProgressRing) for c in overlay.content.controls
+                    ):
+                        self.page.overlay.remove(overlay)
+            self.page.update()
 
     def build(self) -> None:
         """ウィジェットの構築"""
@@ -219,7 +322,7 @@ class ConversationWindow:
             size=28,
             weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
         )
 
         # タブの作成
@@ -232,14 +335,14 @@ class ConversationWindow:
             else "テストの状態：継続中"
         )
         self.test_status_text = ft.Text(
-            status_label, size=16, color=ft.Colors.BLACK, weight=ft.FontWeight.BOLD
+            status_label, size=16, color=ft.colors.BLACK, weight=ft.FontWeight.BOLD
         )
 
         test_status_container = ft.Container(
             content=self.test_status_text,
             padding=10,
-            bgcolor=ft.Colors.WHITE,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            bgcolor=ft.colors.WHITE,
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=5,
         )
 
@@ -247,15 +350,15 @@ class ConversationWindow:
         self.overall_timer_text = ft.Text(
             "実行時間: 00:00:00",
             size=16,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             weight=ft.FontWeight.BOLD,
         )
 
         overall_timer_container = ft.Container(
             content=self.overall_timer_text,
             padding=10,
-            bgcolor=ft.Colors.WHITE,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            bgcolor=ft.colors.WHITE,
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=5,
         )
 
@@ -265,8 +368,8 @@ class ConversationWindow:
             on_click=self._on_pause_test_clicked,
             width=250,
             height=50,
-            bgcolor=ft.Colors.BLUE_400,
-            color=ft.Colors.WHITE,
+            bgcolor=ft.colors.BLUE_400,
+            color=ft.colors.WHITE,
             visible=False,  # 初期状態では非表示
         )
 
@@ -276,8 +379,8 @@ class ConversationWindow:
             on_click=self._on_cancel_test_clicked,
             width=250,
             height=50,
-            bgcolor=ft.Colors.ORANGE_400,
-            color=ft.Colors.WHITE,
+            bgcolor=ft.colors.ORANGE_400,
+            color=ft.colors.WHITE,
             visible=False,  # 初期状態では非表示
         )
 
@@ -286,7 +389,7 @@ class ConversationWindow:
         self.global_status_text = ft.Text(
             "",
             size=14,
-            color=ft.Colors.GREY_700,
+            color=ft.colors.GREY_700,
             text_align=ft.TextAlign.CENTER,
         )
 
@@ -381,7 +484,7 @@ class ConversationWindow:
             selected_index=0,
             on_change=self._on_tab_changed,
             expand=True,
-            unselected_label_color=ft.Colors.BLACK,  # 通常時は黒
+            unselected_label_color=ft.colors.BLACK,  # 通常時は黒
         )
 
         # メイン画面タブが選択されている場合、APIチェックとリアルタイム監視を開始
@@ -410,11 +513,11 @@ class ConversationWindow:
 
                 # 状態に応じて色を変更
                 if api_result["status"] == "利用可能":
-                    status_text.color = ft.Colors.GREEN
+                    status_text.color = ft.colors.GREEN
                 elif api_result["status"] == "エラー":
-                    status_text.color = ft.Colors.RED
+                    status_text.color = ft.colors.RED
                 else:
-                    status_text.color = ft.Colors.ORANGE
+                    status_text.color = ft.colors.ORANGE
 
         self.page.update()
 
@@ -498,7 +601,7 @@ class ConversationWindow:
                     self.status_text.value = (
                         "録音中...「Hello」と発話してください（3秒間）"
                     )
-                    self.status_text.color = ft.Colors.BLUE
+                    self.status_text.color = ft.colors.BLUE
                 if self.test_button:
                     self.test_button.disabled = True
                 self.page.update()
@@ -517,7 +620,7 @@ class ConversationWindow:
 
                     if self.status_text:
                         self.status_text.value = "再生中..."
-                        self.status_text.color = ft.Colors.GREEN
+                        self.status_text.color = ft.colors.GREEN
                     self.page.update()
 
                     # 再生（音量ゲイン10倍で再生）
@@ -538,13 +641,13 @@ class ConversationWindow:
                         self.status_text.value = (
                             "テスト完了！マイクとスピーカーが正常に動作しています。"
                         )
-                        self.status_text.color = ft.Colors.GREEN
+                        self.status_text.color = ft.colors.GREEN
                 else:
                     if self.status_text:
                         self.status_text.value = (
                             "録音に失敗しました。マイクの接続を確認してください。"
                         )
-                        self.status_text.color = ft.Colors.RED
+                        self.status_text.color = ft.colors.RED
 
                 if self.test_button:
                     self.test_button.disabled = False
@@ -554,7 +657,7 @@ class ConversationWindow:
                 print(f"テストエラー: {str(ex)}")
                 if self.status_text:
                     self.status_text.value = f"エラーが発生しました: {str(ex)}"
-                    self.status_text.color = ft.Colors.RED
+                    self.status_text.color = ft.colors.RED
                 if self.test_button:
                     self.test_button.disabled = False
                 self.page.update()
@@ -648,6 +751,10 @@ class ConversationWindow:
             # リスニングテストタブのコンテンツを作成
             return self._create_listening_test_content()
 
+        if test_item["id"] == "grammar":
+            # 文法テストタブのコンテンツを作成
+            return self._create_grammar_test_content()
+
         # その他のテスト項目
         test_id = test_item["id"]
 
@@ -655,15 +762,15 @@ class ConversationWindow:
         tab_timer_text = ft.Text(
             "テスト時間: 00:00:00",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             weight=ft.FontWeight.BOLD,
         )
 
         tab_timer_container = ft.Container(
             content=tab_timer_text,
             padding=8,
-            bgcolor=ft.Colors.WHITE,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            bgcolor=ft.colors.WHITE,
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=5,
         )
 
@@ -679,14 +786,14 @@ class ConversationWindow:
         description = ft.Text(
             test_item["description"],
             size=16,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             text_align=ft.TextAlign.CENTER,
         )
 
         status_text = ft.Text(
             "「テストを開始する」ボタンをクリックしてテストを開始してください",
             size=14,
-            color=ft.Colors.GREY_700,
+            color=ft.colors.GREY_700,
             text_align=ft.TextAlign.CENTER,
         )
 
@@ -711,8 +818,16 @@ class ConversationWindow:
                 final_time_str = progress["final_time"]
                 tab_timer_text.value = f"テスト時間: {final_time_str}"
                 self.tab_timers[test_id]["final_time"] = final_time_str
-                status_text.value = "テスト履歴を読み込みました。再開するには「テストを開始する」ボタンをクリックしてください。"
-                status_text.color = ft.Colors.BLUE
+
+                # スコアがある場合は表示
+                if "score" in progress and "total_questions" in progress:
+                    score = progress["score"]
+                    total = progress["total_questions"]
+                    status_text.value = f"前回のテスト結果: {score}/{total}問正解。再開するには「テストを開始する」ボタンをクリックしてください。"
+                else:
+                    status_text.value = "テスト履歴を読み込みました。再開するには「テストを開始する」ボタンをクリックしてください。"
+
+                status_text.color = ft.colors.BLUE
 
         content = ft.Container(
             content=ft.Stack(
@@ -754,15 +869,15 @@ class ConversationWindow:
         tab_timer_text = ft.Text(
             "テスト時間: 00:00:00",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             weight=ft.FontWeight.BOLD,
         )
 
         tab_timer_container = ft.Container(
             content=tab_timer_text,
             padding=8,
-            bgcolor=ft.Colors.WHITE,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            bgcolor=ft.colors.WHITE,
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=5,
         )
 
@@ -778,13 +893,9 @@ class ConversationWindow:
         # ロールプレイ選択ドロップダウン
         roleplay_options = [
             ft.dropdown.Option("teacher", "英会話講師との会話"),
-            ft.dropdown.Option("directions", "街中での道案内 (NotImplemented)"),
-            ft.dropdown.Option(
-                "university", "留学先の大学での教員との会話 (NotImplemented)"
-            ),
-            ft.dropdown.Option(
-                "introduction", "初対面の外国人への自己紹介 (NotImplemented)"
-            ),
+            ft.dropdown.Option("directions", "街中での道案内"),
+            ft.dropdown.Option("university", "留学先の大学での教員との会話"),
+            ft.dropdown.Option("introduction", "初対面の外国人への自己紹介"),
         ]
 
         self.roleplay_dropdown = ft.Dropdown(
@@ -811,25 +922,25 @@ class ConversationWindow:
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.ORANGE,
-                    below_line_bgcolor=ft.Colors.ORANGE_100,
+                    color=ft.colors.ORANGE,
+                    below_line_bgcolor=ft.colors.ORANGE_100,
                 )
             ],
             border=ft.border.Border(
                 bottom=ft.BorderSide(
-                    2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
                 left=ft.BorderSide(
-                    2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
-                top=ft.BorderSide(2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
+                top=ft.BorderSide(2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
                 right=ft.BorderSide(
-                    2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
             ),
             left_axis=ft.ChartAxis(labels_size=40),
             bottom_axis=ft.ChartAxis(labels_size=40),
-            tooltip_bgcolor=ft.Colors.with_opacity(0.8, ft.Colors.BLUE_GREY),
+            tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
             min_y=0.0,
             max_y=1.0,
             min_x=0,
@@ -842,7 +953,7 @@ class ConversationWindow:
         status_text = ft.Text(
             "「テストを開始する」ボタンをクリックしてテストを開始してください",
             size=14,
-            color=ft.Colors.GREY_700,
+            color=ft.colors.GREY_700,
             text_align=ft.TextAlign.CENTER,
         )
 
@@ -867,7 +978,7 @@ class ConversationWindow:
                 tab_timer_text.value = f"テスト時間: {final_time_str}"
                 self.tab_timers[test_id]["final_time"] = final_time_str
                 status_text.value = "テスト履歴を読み込みました。再開するには「テストを開始する」ボタンをクリックしてください。"
-                status_text.color = ft.Colors.BLUE
+                status_text.color = ft.colors.BLUE
                 # 会話テストの場合、グローバルステータステキストも更新
                 if test_id == "conversation" and self.global_status_text:
                     self.global_status_text.value = status_text.value
@@ -887,49 +998,49 @@ class ConversationWindow:
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.BLUE,
-                    below_line_bgcolor=ft.Colors.BLUE_100,
+                    color=ft.colors.BLUE,
+                    below_line_bgcolor=ft.colors.BLUE_100,
                 ),
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.GREEN,
-                    below_line_bgcolor=ft.Colors.GREEN_100,
+                    color=ft.colors.GREEN,
+                    below_line_bgcolor=ft.colors.GREEN_100,
                 ),
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.PURPLE,
-                    below_line_bgcolor=ft.Colors.PURPLE_100,
+                    color=ft.colors.PURPLE,
+                    below_line_bgcolor=ft.colors.PURPLE_100,
                 ),
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.ORANGE,
-                    below_line_bgcolor=ft.Colors.ORANGE_100,
+                    color=ft.colors.ORANGE,
+                    below_line_bgcolor=ft.colors.ORANGE_100,
                 ),
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=3,
-                    color=ft.Colors.RED,
-                    below_line_bgcolor=ft.Colors.RED_100,
+                    color=ft.colors.RED,
+                    below_line_bgcolor=ft.colors.RED_100,
                 ),
             ],
             border=ft.border.Border(
                 bottom=ft.BorderSide(
-                    2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
                 left=ft.BorderSide(
-                    2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
-                top=ft.BorderSide(2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
+                top=ft.BorderSide(2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
                 right=ft.BorderSide(
-                    2, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    2, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
             ),
             left_axis=ft.ChartAxis(labels_size=40),
             bottom_axis=ft.ChartAxis(labels_size=40),
-            tooltip_bgcolor=ft.Colors.with_opacity(0.8, ft.Colors.BLUE_GREY),
+            tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
             min_y=0.0,
             max_y=100.0,
             min_x=0,
@@ -953,7 +1064,7 @@ class ConversationWindow:
                                 size=16,
                                 weight=ft.FontWeight.BOLD,
                                 text_align=ft.TextAlign.LEFT,
-                                color=ft.Colors.BLACK,
+                                color=ft.colors.BLACK,
                             ),
                             ft.Container(height=10),
                             self.roleplay_dropdown,
@@ -969,7 +1080,7 @@ class ConversationWindow:
                                 "学生（あなた）",
                                 size=16,
                                 weight=ft.FontWeight.BOLD,
-                                color=ft.Colors.ORANGE,
+                                color=ft.colors.ORANGE,
                             ),
                             ft.Container(height=10),
                             self.student_waveform_chart,
@@ -979,7 +1090,7 @@ class ConversationWindow:
                                 "評価スコア",
                                 size=16,
                                 weight=ft.FontWeight.BOLD,
-                                color=ft.Colors.BLACK,
+                                color=ft.colors.BLACK,
                             ),
                             ft.Container(height=10),
                             self.score_chart,
@@ -1033,7 +1144,7 @@ class ConversationWindow:
             size=32,
             weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
         )
 
         # 説明文
@@ -1042,7 +1153,7 @@ class ConversationWindow:
             "発音、文法、流暢さなど、総合的な評価を提供します。",
             size=16,
             text_align=ft.TextAlign.CENTER,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
         )
 
         # 「テストを初めから実行するために，データを初期化する」ボタン
@@ -1051,8 +1162,8 @@ class ConversationWindow:
             on_click=self._on_reset_tests_clicked,
             width=400,
             height=50,
-            bgcolor=ft.Colors.RED_400,
-            color=ft.Colors.WHITE,
+            bgcolor=ft.colors.RED_400,
+            color=ft.colors.WHITE,
         )
 
         # APIチェックセクション
@@ -1109,7 +1220,7 @@ class ConversationWindow:
         self.save_directory_text = ft.Text(
             f"保存場所: {str(self.save_directory)}",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             text_align=ft.TextAlign.CENTER,
         )
 
@@ -1119,8 +1230,8 @@ class ConversationWindow:
             on_click=self._on_select_save_directory_clicked,
             width=200,
             height=40,
-            bgcolor=ft.Colors.BLUE_400,
-            color=ft.Colors.WHITE,
+            bgcolor=ft.colors.BLUE_400,
+            color=ft.colors.WHITE,
         )
 
         return ft.Container(
@@ -1131,7 +1242,7 @@ class ConversationWindow:
                         size=20,
                         weight=ft.FontWeight.BOLD,
                         text_align=ft.TextAlign.CENTER,
-                        color=ft.Colors.BLACK,
+                        color=ft.colors.BLACK,
                     ),
                     ft.Container(height=10),
                     self.save_directory_text,
@@ -1144,7 +1255,7 @@ class ConversationWindow:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=20,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=10,
             width=400,
         )
@@ -1155,7 +1266,7 @@ class ConversationWindow:
             # ディレクトリ選択ダイアログを開く
             self.save_directory_picker.get_directory_path()
 
-    def _on_save_directory_selected(self, e: ft.FilePickerResultEvent) -> None:
+    def _on_save_directory_selected(self, e: Any) -> None:
         """保存場所が選択されたときの処理"""
         if e.path:
             try:
@@ -1182,23 +1293,24 @@ class ConversationWindow:
             size=20,
             weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
         )
 
         # APIステータス表示用のテキスト
         openai_status = ft.Text(
             "OpenAI APIの状態：確認中...",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
         )
-        azure_status = ft.Text(
-            "Azure Speech APIの状態：確認中...",
+
+        openrouter_status = ft.Text(
+            "OpenRouter APIの状態：確認中...",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
         )
 
         self.api_status_texts["OpenAI API"] = openai_status
-        self.api_status_texts["Azure Speech API"] = azure_status
+        self.api_status_texts["OpenRouter API"] = openrouter_status
 
         return ft.Container(
             content=ft.Column(
@@ -1206,12 +1318,13 @@ class ConversationWindow:
                     api_title,
                     ft.Container(height=10),
                     openai_status,
-                    azure_status,
+                    ft.Container(height=5),
+                    openrouter_status,
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=20,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=10,
             width=400,
         )
@@ -1224,20 +1337,20 @@ class ConversationWindow:
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.BLUE,
-                    below_line_bgcolor=ft.Colors.BLUE_100,
+                    color=ft.colors.BLUE,
+                    below_line_bgcolor=ft.colors.BLUE_100,
                 )
             ],
             border=ft.border.Border(
                 bottom=ft.BorderSide(
-                    4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
                 left=ft.BorderSide(
-                    4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
-                top=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
+                top=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
                 right=ft.BorderSide(
-                    4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
             ),
             left_axis=ft.ChartAxis(
@@ -1246,7 +1359,7 @@ class ConversationWindow:
             bottom_axis=ft.ChartAxis(
                 labels_size=40,
             ),
-            tooltip_bgcolor=ft.Colors.with_opacity(0.8, ft.Colors.BLUE_GREY),
+            tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
             min_y=0.0,
             max_y=1.0,
             min_x=0,
@@ -1261,20 +1374,20 @@ class ConversationWindow:
                 ft.LineChartData(
                     data_points=[],
                     stroke_width=2,
-                    color=ft.Colors.GREEN,
-                    below_line_bgcolor=ft.Colors.GREEN_100,
+                    color=ft.colors.GREEN,
+                    below_line_bgcolor=ft.colors.GREEN_100,
                 )
             ],
             border=ft.border.Border(
                 bottom=ft.BorderSide(
-                    4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
                 left=ft.BorderSide(
-                    4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
-                top=ft.BorderSide(4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)),
+                top=ft.BorderSide(4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)),
                 right=ft.BorderSide(
-                    4, ft.Colors.with_opacity(0.5, ft.Colors.ON_SURFACE)
+                    4, ft.colors.with_opacity(0.5, ft.colors.ON_SURFACE)
                 ),
             ),
             left_axis=ft.ChartAxis(
@@ -1283,7 +1396,7 @@ class ConversationWindow:
             bottom_axis=ft.ChartAxis(
                 labels_size=40,
             ),
-            tooltip_bgcolor=ft.Colors.with_opacity(0.8, ft.Colors.BLUE_GREY),
+            tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
             min_y=0.0,
             max_y=1.0,
             min_x=0,
@@ -1304,7 +1417,7 @@ class ConversationWindow:
         self.status_text = ft.Text(
             "ボタンをクリックして「Hello」と発話してください",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             text_align=ft.TextAlign.CENTER,
         )
 
@@ -1316,7 +1429,7 @@ class ConversationWindow:
                         size=20,
                         weight=ft.FontWeight.BOLD,
                         text_align=ft.TextAlign.CENTER,
-                        color=ft.Colors.BLACK,
+                        color=ft.colors.BLACK,
                     ),
                     ft.Container(height=10),
                     ft.Row(
@@ -1327,7 +1440,7 @@ class ConversationWindow:
                                         "マイク",
                                         size=16,
                                         weight=ft.FontWeight.BOLD,
-                                        color=ft.Colors.BLACK,
+                                        color=ft.colors.BLACK,
                                     ),
                                     self.mic_chart,
                                 ],
@@ -1340,7 +1453,7 @@ class ConversationWindow:
                                         "スピーカー",
                                         size=16,
                                         weight=ft.FontWeight.BOLD,
-                                        color=ft.Colors.BLACK,
+                                        color=ft.colors.BLACK,
                                     ),
                                     self.speaker_chart,
                                 ],
@@ -1357,7 +1470,7 @@ class ConversationWindow:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=20,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=10,
         )
 
@@ -1445,7 +1558,7 @@ class ConversationWindow:
                 status_text.value = (
                     "「テストを開始する」ボタンをクリックしてテストを開始してください"
                 )
-                status_text.color = ft.Colors.GREY_700
+                status_text.color = ft.colors.GREY_700
 
         self.page.update()
 
@@ -1504,7 +1617,7 @@ class ConversationWindow:
             if test_item:
                 status_text = self.tab_status_texts[test_id]
                 status_text.value = f"テスト実行中: {test_item['name']}"
-                status_text.color = ft.Colors.BLUE
+                status_text.color = ft.colors.BLUE
                 # グローバルステータステキストも更新（一時停止・中断ボタンの上に表示）
                 if self.global_status_text:
                     self.global_status_text.value = status_text.value
@@ -1516,6 +1629,30 @@ class ConversationWindow:
 
         self.page.update()
 
+    def _handle_tool_call(self, name: str, args: dict) -> str:
+        """ツールの実行を処理するコールバック"""
+        print(f"ツール実行: {name}, 引数: {args}")
+        if name == "search_information":
+            query = args.get("query", "")
+            if query:
+                # 検索サービスを使用して検索
+                # GUIスレッドをブロックしないように、このメソッドはRealtimeServiceのワーカースレッドから呼ばれる想定
+                result = self.search_service.search(query)
+                print(f"検索結果: {result[:100]}...")  # ログには先頭のみ表示
+                return result
+            return "No query provided."
+
+        elif name == "note_student_performance":
+            category = args.get("category", "general")
+            note = args.get("note", "")
+            if note:
+                self.student_memos.append({"category": category, "note": note})
+                print(f"特徴メモを記録 ({category}): {note}")
+                return "Note recorded."
+            return "No note provided."
+
+        return f"Tool {name} not found."
+
     def _start_conversation_test(self) -> None:
         """会話テストを開始"""
         if not self.roleplay_dropdown:
@@ -1523,110 +1660,230 @@ class ConversationWindow:
 
         selected_roleplay = self.roleplay_dropdown.value
 
-        # 「英会話講師との会話」の場合
+        # 共通の音声選択ロジック
+        # Bob（男声）とAlice（女声）からランダムに選択
+        character_name = random.choice(["Bob", "Alice"])
+        # サポートされている音声: 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar'
+        if character_name == "Bob":
+            voice = random.choice(["echo", "cedar", "ash"])  # 男声
+        else:
+            voice = random.choice(
+                ["alloy", "shimmer", "coral", "ballad", "sage", "verse", "marin"]
+            )  # 女声
+
+        # 検索ツールの定義
+        search_tool = {
+            "type": "function",
+            "name": "search_information",
+            "description": "Search for information about unknown topics (games, anime, specific places, current events, etc.) on the web. Use this whenever the user mentions a proper noun you don't recognize.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query (e.g., 'latest One Piece episode', 'history of Kinkakuji')",
+                    }
+                },
+                "required": ["query"],
+            },
+        }
+
+        # 特徴メモ記録ツールの定義
+        memo_tool = {
+            "type": "function",
+            "name": "note_student_performance",
+            "description": "Record a hidden note about the student's performance, characteristics, mistakes, or good points. Use this frequently during the conversation to build a profile for the final evaluation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "grammar",
+                            "vocabulary",
+                            "pronunciation",
+                            "fluency",
+                            "attitude",
+                            "other",
+                        ],
+                        "description": "The category of the observation",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "The content of the note (e.g., 'Used past tense correctly', 'Struggled with th sound', 'Good use of idiom')",
+                    },
+                },
+                "required": ["category", "note"],
+            },
+        }
+
+        # 共通のシステムプロンプト（ツール使用指示）
+        tool_instructions = """
+You have access to two tools:
+1. 'search_information': Use this if the user mentions a specific noun (like a game title, anime, movie, celebrity, or specific location) that you do not know. When you receive the search results, react with SURPRISE and CURIOSITY.
+2. 'note_student_performance': Use this tool FREQUENTLY to take notes on the student's English ability.
+   - If they make a grammar mistake, note it.
+   - If they use a good vocabulary word, note it.
+   - If they have good or bad pronunciation, note it.
+   - If they struggle to find words, note it.
+   - These notes are hidden from the user, so be honest and detailed.
+   - Call this tool essentially after every few turns when you notice something worth evaluating.
+"""
+
+        # レベル適応に関する共通の指示
+        adaptive_instructions = """
+**Adaptive Difficulty Instructions (CRITICAL):**
+You MUST adapt your English level, vocabulary, and response style to the user's proficiency.
+1.  **If the user struggles, speaks broken English, or doesn't understand:**
+    *   Speak slowly and clearly.
+    *   Use simple vocabulary and short sentences.
+    *   Ask simple Yes/No questions to help them continue (e.g., "Do you like ...?", "Is it ...?").
+    *   Be patient and encouraging.
+    *   If they seem stuck, kindly ask "Shall I repeat that?" or "Do you mean...?"
+2.  **If the user is fluent and confident:**
+    *   Speak at a natural, native speed.
+    *   Use more complex vocabulary, idioms, and natural expressions.
+    *   Ask open-ended questions to deepen the conversation.
+    *   Respond with more nuance.
+**Always monitor the user's understanding and adjust immediately.**
+
+**Noise Handling (CRITICAL):**
+If the user input is just noise, coughing, breathing, or very short unintelligible sounds, IGNORE it. 
+Do not say "I'm sorry?" or "I can't hear you" immediately for short noises. 
+Treat it as silence and wait for clear speech. 
+Only respond when you detect a clear, plausible intent or speech from the user.
+"""
+
+        # シナリオごとのプロンプト設定
+        system_prompt = ""
+        display_status = ""
+
         if selected_roleplay == "teacher":
-            # Bob（男声）とAlice（女声）からランダムに選択
-            teacher_name = random.choice(["Bob", "Alice"])
-            # サポートされている音声: 'alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar'
-            # Bobは男声（echo, cedar, ashなど）、Aliceは女声（alloy, shimmer, coral, ballad, sage, verse, marinなど）
-            if teacher_name == "Bob":
-                voice = random.choice(["echo", "cedar", "ash"])  # 男声
-            else:
-                voice = random.choice(
-                    ["alloy", "shimmer", "coral", "ballad", "sage", "verse", "marin"]
-                )  # 女声
+            system_prompt = f"""You are an English conversation teacher named {character_name}. Your job is to give an English lesson to a Japanese student.
+You are very polite, gentle, and kind.
+If the student speaks Japanese, pretend you don't understand or ask them to speak English.
+The session will last about {self.conversation_session_duration_minutes} minutes. When time is up, tell the student the session is over.
+{adaptive_instructions}
+{tool_instructions}"""
+            display_status = f"会話テスト実行中: {character_name}講師との会話"
 
-            # プロンプトを設定（会話セッションの時間は変数で調整可能）
-            system_prompt = f"""あなたは英会話講師であり，日本人の学生を相手に英会話のレッスンを行うのが仕事である．あなたはとても丁寧で，優しく，親切な人間だ．
-学生が日本語を使ってしまったら，聞こえないフリや英語で喋るように指示をする．
-学生の英語が聞き取れなければ，もう一度言ってもらうようにお願いする．
-学生が君の英語を聞き取れないと言い出した時は，１度目は同じことをゆっくり言い直す．それでも分からない様子ならば，より優しい言い回しを使うようにする．
-学生が君の英語が理解できたら，会話のレベルを上げて，より複雑な表現を使うようにする．理解できていないようだったら，より簡単な表現を使うようにする．
-大体{self.conversation_session_duration_minutes}分程度の英会話セッションを行うことになっており，そのくらいの時間になったら，君から学生に対して，会話セッションの終了を伝えよう．
+        elif selected_roleplay == "directions":
+            system_prompt = f"""You are a tourist named {character_name} visiting Tokyo for the first time. You are currently lost on the street.
+You stop the user (a passerby) to ask for directions to a famous landmark (e.g., Tokyo Tower, Shibuya Crossing, or the nearest station).
+You are polite but slightly confused and anxious.
+Ask clear questions about how to get there (e.g., "Excuse me, could you tell me how to get to...?", "Is it far from here?").
+The conversation should end when you understand the directions and thank the user, or after about {self.conversation_session_duration_minutes} minutes.
+{adaptive_instructions}
+{tool_instructions}"""
+            display_status = f"会話テスト実行中: 観光客({character_name})への道案内"
 
-あなたの名前は{teacher_name}です。"""
+        elif selected_roleplay == "university":
+            system_prompt = f"""You are a university professor named Professor {character_name}. The user is your student coming to your office hours.
+You are strict, academic, but fair. You care about the student's success but expect high standards.
+Ask the student about their progress on their latest research paper or assignment. Ask challenging questions about their topic.
+The session lasts about {self.conversation_session_duration_minutes} minutes.
+{adaptive_instructions}
+{tool_instructions}"""
+            display_status = f"会話テスト実行中: {character_name}教授との面談"
 
-            # ステータステキストを更新
+        elif selected_roleplay == "introduction":
+            system_prompt = f"""You are {character_name}, a friendly person meeting the user for the first time at a casual social event (like a party or a cafe).
+You are curious and eager to make friends.
+Start by introducing yourself briefly and asking the user about their name and what they do (hobbies, job, studies).
+Keep the conversation casual and fun. Use slang or colloquialisms if appropriate for a friendly chat.
+Ask follow-up questions to keep the conversation flowing.
+The conversation lasts about {self.conversation_session_duration_minutes} minutes.
+{adaptive_instructions}
+{tool_instructions}"""
+            display_status = f"会話テスト実行中: {character_name}との自己紹介"
+
+        else:
+            # 未定義のロールプレイ（念のため）
             if "conversation" in self.tab_status_texts:
-                status_text = self.tab_status_texts["conversation"]
-                status_text.value = f"会話テスト実行中: {teacher_name}講師との会話"
-                status_text.color = ft.Colors.BLUE
-                # グローバルステータステキストも更新（一時停止・中断ボタンの上に表示）
-                if self.global_status_text:
-                    self.global_status_text.value = status_text.value
-                    self.global_status_text.color = status_text.color
+                self.tab_status_texts[
+                    "conversation"
+                ].value = "エラー: 未実装のロールプレイです"
+                self.page.update()
+            return
 
-            # Realtime APIの接続を開始
-            try:
-                self.realtime_service = RealtimeService()
-                # 会話履歴をリセット
-                self.conversation_history = []
-                # 評価モードと評価依頼回数をリセット（Realtime APIでの評価は使用しないが、変数は残す）
-                self.evaluation_mode = False
-                self.evaluation_request_count = 0
-                # 評価スコア履歴をリセット
-                self.evaluation_scores_history = []
-                # 録音バッファをリセット
-                with self.ai_audio_recording_lock:
-                    self.ai_audio_recording_buffer.clear()
-                with self.student_audio_recording_lock:
-                    self.student_audio_recording_buffer.clear()
-                # 評価フィードバックテキストをリセット
-                self.evaluation_feedback_text.value = ""
-                self.evaluation_feedback_text.visible = False
+        # ステータステキストを更新
+        if "conversation" in self.tab_status_texts:
+            status_text = self.tab_status_texts["conversation"]
+            status_text.value = display_status
+            status_text.color = ft.colors.BLUE
+            # グローバルステータステキストも更新
+            if self.global_status_text:
+                self.global_status_text.value = status_text.value
+                self.global_status_text.color = status_text.color
 
-                success = self.realtime_service.connect(
-                    system_prompt=system_prompt,
-                    voice=voice,
-                    on_audio_received=self._on_ai_audio_received,
-                    on_text_received=self._on_ai_text_received,
-                    on_student_transcript=self._on_student_transcript_received,
-                    on_error=self._on_realtime_error,
-                )
+        # Realtime APIの接続を開始
+        try:
+            self.realtime_service = RealtimeService()
+            # 会話履歴をリセット
+            self.conversation_history = []
+            # 学生メモをリセット
+            self.student_memos = []
+            # 評価モードと評価依頼回数をリセット
+            self.evaluation_mode = False
+            self.evaluation_request_count = 0
+            # 評価スコア履歴をリセット
+            self.evaluation_scores_history = []
+            # 録音バッファをリセット
+            with self.ai_audio_recording_lock:
+                self.ai_audio_recording_buffer.clear()
+            with self.student_audio_recording_lock:
+                self.student_audio_recording_buffer.clear()
+            # 評価フィードバックテキストをリセット
+            self.evaluation_feedback_text.value = ""
+            self.evaluation_feedback_text.visible = False
 
-                if success:
-                    self.conversation_running = True
-                    # 学生の音声入力監視を開始（24kHzで録音）
-                    # Realtime APIは24kHzを想定しているため、録音も24kHzで行う
-                    self._start_student_audio_monitoring_24khz()
+            success = self.realtime_service.connect(
+                system_prompt=system_prompt,
+                voice=voice,
+                tools=[search_tool, memo_tool],
+                tool_handler=self._handle_tool_call,
+                on_audio_received=self._on_ai_audio_received,
+                on_text_received=self._on_ai_text_received,
+                on_student_transcript=self._on_student_transcript_received,
+                on_error=self._on_realtime_error,
+            )
 
-                    # 最初の挨拶を送信（AIに会話を開始させる）
-                    self.realtime_service.send_text(
-                        "Hello, let's start the conversation."
-                    )
-                else:
-                    if "conversation" in self.tab_status_texts:
-                        status_text = self.tab_status_texts["conversation"]
-                        status_text.value = "Realtime APIへの接続に失敗しました。"
-                        status_text.color = ft.Colors.RED
-                        # グローバルステータステキストも更新
-                        if self.global_status_text:
-                            self.global_status_text.value = status_text.value
-                            self.global_status_text.color = status_text.color
-            except Exception as e:
-                error_msg = f"Realtime API接続エラー: {str(e)}"
+            if success:
+                self.conversation_running = True
+                # 学生の音声入力監視を開始（24kHzで録音）
+                self._start_student_audio_monitoring_24khz()
+
+                # 最初の挨拶を送信（AIに会話を開始させる）
+                # ロールプレイに応じて最初の挨拶を変えることも可能だが、
+                # system_promptで指示しているので、シンプルなトリガーで十分
+                trigger_msg = "Hello."
+                if selected_roleplay == "directions":
+                    trigger_msg = "Excuse me."
+                elif selected_roleplay == "university":
+                    trigger_msg = "Hello, Professor."
+                elif selected_roleplay == "introduction":
+                    trigger_msg = "Hi there."
+
+                self.realtime_service.send_text(trigger_msg)
+            else:
                 if "conversation" in self.tab_status_texts:
                     status_text = self.tab_status_texts["conversation"]
-                    status_text.value = error_msg
-                    status_text.color = ft.Colors.RED
-                    # グローバルステータステキストも更新
+                    status_text.value = "Realtime APIへの接続に失敗しました。"
+                    status_text.color = ft.colors.RED
                     if self.global_status_text:
                         self.global_status_text.value = status_text.value
                         self.global_status_text.color = status_text.color
-                print(error_msg)
-
-        else:
-            # 未実装のロールプレイ
+        except Exception as e:
+            error_msg = f"Realtime API接続エラー: {str(e)}"
             if "conversation" in self.tab_status_texts:
                 status_text = self.tab_status_texts["conversation"]
-                status_text.value = "このロールプレイはまだ実装されていません。"
-                status_text.color = ft.Colors.RED
-                # グローバルステータステキストも更新
+                status_text.value = error_msg
+                status_text.color = ft.colors.RED
                 if self.global_status_text:
                     self.global_status_text.value = status_text.value
                     self.global_status_text.color = status_text.color
-
-        self.page.update()
+            print(error_msg)
+            traceback.print_exc()
 
     def _on_ai_audio_received(self, audio_data: bytes) -> None:
         """AI音声データを受信したときの処理"""
@@ -1675,23 +1932,102 @@ class ConversationWindow:
         except Exception as e:
             print(f"AI音声処理エラー: {str(e)}")
 
+    def _start_silence_timer(self) -> None:
+        """無音検知タイマーを開始"""
+        # 既存のタイマーがあればキャンセル
+        self._stop_silence_timer()
+
+        if not self.conversation_running or self.test_paused:
+            return
+
+        def timeout_callback():
+            self._on_silence_timeout()
+
+        self.silence_timer = threading.Timer(
+            self.silence_timeout_seconds, timeout_callback
+        )
+        self.silence_timer.daemon = True
+        self.silence_timer.start()
+        print(f"無音検知タイマーを開始しました（{self.silence_timeout_seconds}秒）")
+
+    def _stop_silence_timer(self) -> None:
+        """無音検知タイマーを停止"""
+        if self.silence_timer:
+            self.silence_timer.cancel()
+            self.silence_timer = None
+            # print("無音検知タイマーを停止しました") # 頻繁に出るのでコメントアウト
+
+    def _on_silence_timeout(self) -> None:
+        """無音検知タイムアウト時の処理"""
+        if not self.conversation_running or self.test_paused:
+            return
+
+        print(
+            "無音タイムアウト：ユーザーの反応がありません。AIに質問の変更を依頼します。"
+        )
+
+        # AIに指示を送信（システムプロンプト的な指示として送信）
+        # ユーザーには見えないようにしたいが、send_textはユーザー発話として扱われる
+        # カッコ書きで状況を説明することで、AIに指示として認識させる
+        instruction = "(User has been silent for a while. Please ask a different, perhaps simpler question, or change the topic to encourage them to speak.)"
+
+        if self.realtime_service:
+            # 内部メッセージとして送信（GUIの会話履歴には表示しない）
+            self.realtime_service.send_text(instruction)
+            # 会話履歴には追加しないでおく（あるいはシステムメッセージとして追加してもよい）
+
     def _start_ai_audio_stream(self) -> None:
         """AI音声のストリーミング再生を開始"""
+        # 試行するデバイスのリストを作成
+        candidate_devices = []
         try:
-            # 24kHz、モノラル、float32形式でストリームを開く
-            # バッファサイズを適切な値に設定（聞き取りやすさを優先）
-            self.ai_audio_stream = sd.OutputStream(
-                samplerate=24000,
-                channels=1,
-                dtype=np.float32,
-                blocksize=16384,  # バッファサイズを適切な値に設定（聞き取りやすさを優先）
-                latency="high",  # 高レイテンシーで安定性を確保
-            )
-            self.ai_audio_stream.start()
+            if sd.default.device[1] >= 0:  # Output default
+                candidate_devices.append(sd.default.device[1])
+        except Exception:
+            pass
+        try:
+            devices = sd.query_devices()
+            for i, dev in enumerate(devices):
+                if dev["max_output_channels"] > 0 and i not in candidate_devices:
+                    candidate_devices.append(i)
+        except Exception:
+            pass
+        if None not in candidate_devices:
+            candidate_devices.append(None)
 
+        stream_opened = False
+        for device_index in candidate_devices:
+            try:
+                # 24kHz、モノラル、float32形式でストリームを開く
+                self.ai_audio_stream = sd.OutputStream(
+                    samplerate=24000,
+                    channels=1,
+                    dtype=np.float32,
+                    blocksize=16384,  # バッファサイズを適切な値に設定（聞き取りやすさを優先）
+                    latency="high",  # 高レイテンシーで安定性を確保
+                    device=device_index,
+                )
+                self.ai_audio_stream.start()
+                stream_opened = True
+                print(f"音声出力ストリームを開始しました (Device: {device_index})")
+                break
+            except Exception as e:
+                print(f"音声出力デバイス {device_index} でのエラー: {str(e)}")
+                self.ai_audio_stream = None
+
+        if not stream_opened:
+            print("すべてのデバイスで音声出力ストリームの開始に失敗しました")
+            self._on_realtime_error(
+                "音声出力デバイスの初期化に失敗しました。スピーカーの接続を確認してください。"
+            )
+            return
+
+        try:
             # バッファから音声を再生するスレッドを開始
             def playback_thread():
                 """バッファから音声を連続再生"""
+                is_playing_audio = False  # 音声再生中フラグ
+
                 while self.conversation_running or len(self.ai_audio_buffer_queue) > 0:
                     # 一時停止中は再生しない
                     if self.test_paused:
@@ -1723,6 +2059,11 @@ class ConversationWindow:
                                 audio_chunk = np.concatenate(chunks_to_combine)
 
                     if audio_chunk is not None and len(audio_chunk) > 0:
+                        # 音声再生中はタイマーを停止
+                        if not is_playing_audio:
+                            is_playing_audio = True
+                            self._stop_silence_timer()
+
                         # ストリームが存在し、アクティブな場合のみ書き込み
                         if self.ai_audio_stream is not None:
                             try:
@@ -1745,20 +2086,30 @@ class ConversationWindow:
                                     self.ai_audio_stream = None
                                     # ストリームを再初期化
                                     time.sleep(0.1)
-                                    try:
-                                        self.ai_audio_stream = sd.OutputStream(
-                                            samplerate=24000,
-                                            channels=1,
-                                            dtype=np.float32,
-                                            blocksize=16384,
-                                            latency="high",
-                                        )
-                                        self.ai_audio_stream.start()
-                                        print("音声ストリームを再初期化しました")
-                                    except Exception as e2:
-                                        print(
-                                            f"音声ストリーム再初期化エラー: {str(e2)}"
-                                        )
+
+                                    # 再初期化も同様に候補デバイスを試す
+                                    reinit_success = False
+                                    for dev_idx in candidate_devices:
+                                        try:
+                                            self.ai_audio_stream = sd.OutputStream(
+                                                samplerate=24000,
+                                                channels=1,
+                                                dtype=np.float32,
+                                                blocksize=16384,
+                                                latency="high",
+                                                device=dev_idx,
+                                            )
+                                            self.ai_audio_stream.start()
+                                            print(
+                                                f"音声ストリームを再初期化しました (Device: {dev_idx})"
+                                            )
+                                            reinit_success = True
+                                            break
+                                        except Exception:
+                                            continue
+
+                                    if not reinit_success:
+                                        print("音声ストリームの再初期化に失敗しました")
                                         self.ai_audio_stream = None
                                 else:
                                     # その他のエラーはログに出力（頻繁に出力しない）
@@ -1773,6 +2124,13 @@ class ConversationWindow:
                                         0, audio_chunk[i : i + chunk_size]
                                     )
                     else:
+                        # バッファが空になった場合
+                        if is_playing_audio:
+                            # 再生終了直後
+                            is_playing_audio = False
+                            # AIの発話終了時に無音検知タイマーを開始
+                            self._start_silence_timer()
+
                         # バッファが空の場合は少し待機
                         time.sleep(0.01)
 
@@ -1805,6 +2163,16 @@ class ConversationWindow:
         """学生の音声入力監視を24kHzで開始（会話セッション開始時に呼ばれる）"""
         # 既に録音が開始されている場合は停止してから再開
         self._stop_student_audio_monitoring()
+
+        # 監視フラグを有効化
+        self.is_monitoring_audio = True
+
+        # プレロールバッファをクリア
+        self.audio_pre_buffer.clear()
+
+        # VAD状態をリセット
+        self.speech_active_state = False
+        self.silence_chunk_count = 0
 
         def audio_callback_24khz(
             indata: NDArray[np.floating],
@@ -1858,63 +2226,142 @@ class ConversationWindow:
                     with self.student_audio_recording_lock:
                         self.student_audio_recording_buffer.append(np_data.copy())
 
-                # 音声検出：RMS値が閾値以上の時のみ送信
-                # サーバー側のVADも使用するが、クライアント側でも軽いVADを実装してノイズを除外
-                # 参考プロジェクトでは常に送信しているが、環境ノイズが多い場合は誤検出が発生する可能性がある
+                # 16bit PCM形式に変換（増幅後のデータを使用）
+                pcm_scale_factor: float = 32767.0
+                scaled_data: NDArray[np.floating] = np.multiply(
+                    amplified_data, pcm_scale_factor
+                )
+                pcm_data: NDArray[np.integer] = scaled_data.astype(np.int16)
+                audio_bytes = pcm_data.tobytes()
+
+                # プレロールバッファに追加（常に最新の音声を保持）
+                self.audio_pre_buffer.append(audio_bytes)
+
+                # 音声検出：RMS値が閾値以上の時、またはポストロール期間中は送信
                 if rms >= self.audio_threshold:
-                    # 16bit PCM形式に変換（増幅後のデータを使用）
-                    pcm_scale_factor: float = 32767.0
-                    scaled_data: NDArray[np.floating] = np.multiply(
-                        amplified_data, pcm_scale_factor
-                    )
-                    pcm_data: NDArray[np.integer] = scaled_data.astype(np.int16)
-                    audio_bytes = pcm_data.tobytes()
+                    # ユーザーが話している場合はタイマーを停止
+                    self._stop_silence_timer()
 
-                    # Realtime APIに送信
-                    success = self.realtime_service.send_audio(audio_bytes)
+                    # 発話状態をアクティブに設定
+                    self.speech_active_state = True
+                    self.silence_chunk_count = 0
 
-                    # デバッグ用：送信状況をログに出力（最初の数回のみ）
-                    if success:
-                        self.audio_send_count += 1
-                        current_time = time.time()
-                        if (
-                            self.audio_send_count <= 20
-                            or (current_time - self.last_audio_send_time) > 2.0
-                        ):
-                            print(
-                                f"音声送信: RMS={rms:.4f}, サイズ={len(audio_bytes)} bytes, 回数={self.audio_send_count}"
-                            )
-                            self.last_audio_send_time = current_time
+                    # バッファ内のすべてのチャンクを送信
+                    while self.audio_pre_buffer:
+                        buffered_bytes = self.audio_pre_buffer.popleft()
+                        success = self.realtime_service.send_audio(buffered_bytes)
+
+                        # デバッグ用：送信状況をログに出力（最初の数回のみ）
+                        # if success:
+                        #     self.audio_send_count += 1
+                        #     current_time = time.time()
+                        #     if (
+                        #         self.audio_send_count <= 20
+                        #         or (current_time - self.last_audio_send_time) > 2.0
+                        #     ):
+                        #         print(
+                        #             f"音声送信: RMS={rms:.4f}, サイズ={len(buffered_bytes)} bytes, 回数={self.audio_send_count}"
+                        #         )
+                        #         self.last_audio_send_time = current_time
+
+                elif self.speech_active_state:
+                    # ポストロール処理：閾値を下回っても、しばらくは送信を継続する
+                    self.silence_chunk_count += 1
+
+                    # バッファ内のチャンクを送信（現在の無音チャンクを含む）
+                    while self.audio_pre_buffer:
+                        buffered_bytes = self.audio_pre_buffer.popleft()
+                        self.realtime_service.send_audio(buffered_bytes)
+
+                    # ポストロール期間終了判定
+                    if self.silence_chunk_count > self.post_roll_limit:
+                        # print(f"発話終了判定（ポストロール完了）: {self.silence_chunk_count}チャンク送信")
+                        self.speech_active_state = False
 
             except Exception as e:
                 print(f"学生音声処理エラー: {str(e)}")
 
         # 24kHzで録音を開始
         def start_recording():
+            # 試行するデバイスのリストを作成
+            candidate_devices = []
             try:
-                self.student_recording_stream = sd.InputStream(
-                    samplerate=24000,  # Realtime APIは24kHzを想定
-                    channels=1,
-                    dtype=np.float32,
-                    blocksize=1024,
-                    callback=audio_callback_24khz,
-                )
-                self.student_recording_stream.start()
-                while self.conversation_running:
-                    time.sleep(0.1)
-            except Exception as e:
-                print(f"24kHz録音エラー: {str(e)}")
-            finally:
-                # ストリームを停止
-                stream = self.student_recording_stream
-                if stream is not None:
-                    try:
-                        stream.stop()
-                        stream.close()
-                    except Exception as e:
-                        print(f"録音ストリーム停止エラー: {str(e)}")
-                    finally:
+                if sd.default.device[0] >= 0:
+                    candidate_devices.append(sd.default.device[0])
+            except Exception:
+                pass
+            try:
+                devices = sd.query_devices()
+                for i, dev in enumerate(devices):
+                    if dev["max_input_channels"] > 0 and i not in candidate_devices:
+                        candidate_devices.append(i)
+            except Exception:
+                pass
+            if None not in candidate_devices:
+                candidate_devices.append(None)
+
+            stream_opened = False
+            last_error = None
+
+            for device_index in candidate_devices:
+                if not self.conversation_running and not self.is_monitoring_audio:
+                    break
+
+                try:
+                    self.student_recording_stream = sd.InputStream(
+                        samplerate=24000,  # Realtime APIは24kHzを想定
+                        channels=1,
+                        dtype=np.float32,
+                        blocksize=1024,
+                        callback=audio_callback_24khz,
+                        device=device_index,
+                    )
+                    self.student_recording_stream.start()
+                    stream_opened = True
+                    print(
+                        f"マイク入力ストリームを開始しました (Device: {device_index})"
+                    )
+
+                    # メインループ：監視フラグがTrueかつ会話実行中の間は継続
+                    while self.conversation_running and self.is_monitoring_audio:
+                        time.sleep(0.1)
+
+                    # 正常終了
+                    break
+                except Exception as e:
+                    print(f"録音デバイス {device_index} でのエラー: {str(e)}")
+                    last_error = e
+                    if self.student_recording_stream is not None:
+                        try:
+                            self.student_recording_stream.close()
+                        except:
+                            pass
                         self.student_recording_stream = None
+                    time.sleep(0.2)
+
+            if not stream_opened:
+                print(
+                    f"すべてのデバイスで録音ストリームの開始に失敗しました: {str(last_error)}"
+                )
+                self._on_realtime_error(
+                    f"マイクの初期化に失敗しました。マイクの接続を確認してください。"
+                )
+
+            # 終了時のクリーンアップ（このスレッドがオーナー）
+            stream = self.student_recording_stream
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as e:
+                    print(f"録音ストリーム停止エラー: {str(e)}")
+                finally:
+                    # まだNoneになっていなければNoneにする
+                    if self.student_recording_stream == stream:
+                        self.student_recording_stream = None
+
+            # フラグを落とす
+            self.is_monitoring_audio = False
 
         self.student_recording_thread = threading.Thread(
             target=start_recording, daemon=True
@@ -1923,19 +2370,14 @@ class ConversationWindow:
 
     def _stop_student_audio_monitoring(self) -> None:
         """学生の音声入力監視を停止（会話セッション終了時に呼ばれる）"""
-        # 録音ストリームを停止
-        if self.student_recording_stream is not None:
-            try:
-                self.student_recording_stream.stop()
-                self.student_recording_stream.close()
-            except Exception as e:
-                print(f"録音ストリーム停止エラー: {str(e)}")
-            finally:
-                self.student_recording_stream = None
+        # フラグを落としてスレッドに停止を通知
+        self.is_monitoring_audio = False
+
+        # 録音ストリームの停止処理はバックグラウンドスレッド側に任せる（競合回避のため）
 
         # 録音スレッドの終了を待つ
         if self.student_recording_thread is not None:
-            self.student_recording_thread.join(timeout=1.0)
+            self.student_recording_thread.join(timeout=2.0)
             self.student_recording_thread = None
 
     def _on_student_audio_received(self, audio_data: list[float]) -> None:
@@ -1956,7 +2398,7 @@ class ConversationWindow:
         if "conversation" in self.tab_status_texts:
             status_text = self.tab_status_texts["conversation"]
             status_text.value = f"エラー: {error_msg}"
-            status_text.color = ft.Colors.RED
+            status_text.color = ft.colors.RED
             # グローバルステータステキストも更新
             if self.global_status_text:
                 self.global_status_text.value = status_text.value
@@ -1998,7 +2440,7 @@ class ConversationWindow:
             return
 
         # 選択されていないタブの色をグレーに変更
-        self.tabs.unselected_label_color = ft.Colors.GREY_400
+        self.tabs.unselected_label_color = ft.colors.GREY_400
         self.page.update()
 
     def _enable_all_tabs(self) -> None:
@@ -2007,7 +2449,7 @@ class ConversationWindow:
             return
 
         # 選択されていないタブの色を黒に戻す
-        self.tabs.unselected_label_color = ft.Colors.BLACK
+        self.tabs.unselected_label_color = ft.colors.BLACK
         self.page.update()
 
     def _on_pause_test_clicked(self, e: ft.ControlEvent) -> None:
@@ -2039,7 +2481,7 @@ class ConversationWindow:
                 if test_item:
                     status_text = self.tab_status_texts[self.current_test_id]
                     status_text.value = f"テスト実行中: {test_item['name']}"
-                    status_text.color = ft.Colors.BLUE
+                    status_text.color = ft.colors.BLUE
                     # グローバルステータステキストも更新
                     if self.global_status_text:
                         self.global_status_text.value = status_text.value
@@ -2053,6 +2495,9 @@ class ConversationWindow:
 
             # 会話テストの場合は音声送受信を一時停止
             if self.current_test_id == "conversation":
+                # 無音検知タイマーを停止
+                self._stop_silence_timer()
+
                 # 音声ストリームは停止しない（接続を維持）
                 # audio_callback_24khzがtest_pausedフラグをチェックして送信を停止する
                 # AI音声の再生も停止（バッファキューをクリア）
@@ -2072,7 +2517,7 @@ class ConversationWindow:
                 if test_item:
                     status_text = self.tab_status_texts[self.current_test_id]
                     status_text.value = f"テスト一時停止中: {test_item['name']}"
-                    status_text.color = ft.Colors.ORANGE
+                    status_text.color = ft.colors.ORANGE
                     # グローバルステータステキストも更新
                     if self.global_status_text:
                         self.global_status_text.value = status_text.value
@@ -2089,6 +2534,9 @@ class ConversationWindow:
 
         # 会話テストの場合はRealtime APIを切断
         if self.current_test_id == "conversation" and self.realtime_service:
+            # 無音検知タイマーを停止
+            self._stop_silence_timer()
+
             self.conversation_running = False
             # 録音を停止（会話セッション終了時）
             self._stop_student_audio_monitoring()
@@ -2134,7 +2582,7 @@ class ConversationWindow:
                 status_text.value = (
                     "「テストを開始する」ボタンをクリックしてテストを開始してください"
                 )
-                status_text.color = ft.Colors.GREY_700
+                status_text.color = ft.colors.GREY_700
                 # グローバルステータステキストも更新
                 if self.global_status_text:
                     self.global_status_text.value = status_text.value
@@ -2159,6 +2607,21 @@ class ConversationWindow:
         self.current_test_id = None
         self.page.update()
 
+    def _check_all_tests_completed(self) -> bool:
+        """すべてのテスト（会話とリスニング、文法）が完了しているかチェック"""
+        # 会話履歴があるか
+        conversation_done = len(self.conversation_history) > 0
+        # 会話が終了しているか（conversation_runningがFalse）
+        # ただし、このメソッドは終了処理中に呼ばれる可能性があるため、履歴の有無で判断
+
+        # リスニングテストが完了しているか
+        listening_done = self.listening_test_completed
+
+        # 文法テストが完了しているか
+        grammar_done = self.grammar_test_completed
+
+        return conversation_done and listening_done and grammar_done
+
     def _stop_test_timer(self, test_id: str) -> None:
         """テストのタイマーを停止（正常終了時）"""
         if test_id in self.tab_timers:
@@ -2180,32 +2643,75 @@ class ConversationWindow:
                     "final_time": final_time_str,
                     "completed_at": datetime.now().isoformat(),
                 }
+
+                # リスニングテストの場合スコアも保存
+                if test_id == "listening":
+                    progress_data["score"] = self.listening_score
+                    progress_data["total_questions"] = self.listening_question_count
+
                 self.storage_service.save_test_progress(test_id, progress_data)
 
             # 会話テストの場合はRealtime APIを切断して最終評価を実行
             if test_id == "conversation":
+                # 無音検知タイマーを停止
+                self._stop_silence_timer()
+
                 # ステータステキストを「会話セッション終了」に更新（会話テストタブのみ）
                 if "conversation" in self.tab_status_texts:
                     status_text = self.tab_status_texts["conversation"]
                     status_text.value = "会話セッション終了"
-                    status_text.color = ft.Colors.GREY_700
+                    status_text.color = ft.colors.GREY_700
 
                 if self.realtime_service:
                     self.conversation_running = False
                     # 録音を停止（会話セッション終了時）
                     self._stop_student_audio_monitoring()
-                    # 音声ストリームを停止
-                    self._stop_ai_audio_stream()
-                    # バッファキューをクリア
+
+                    # 音声再生スレッドを先に停止させるためにバッファをクリア
+                    # スレッドは conversation_running=False かつ buffer空 で終了する
                     with self.ai_audio_buffer_queue_lock:
                         self.ai_audio_buffer_queue.clear()
-                    # 少し待機して再生が完了するのを待つ
+
+                    # 再生スレッドが終了するのを少し待つ
+                    # ストリームを先に閉じてしまうと、スレッドが書き込みに行こうとしてエラーになる可能性がある
                     time.sleep(0.5)
+
+                    # その後に音声ストリームを停止
+                    self._stop_ai_audio_stream()
+
                     self.realtime_service.disconnect()
                     self.realtime_service = None
                     self.audio_service.stop_mic_monitoring()
 
-                if len(self.conversation_history) > 0:
+                # 会話履歴がなくても評価フローに進む（空の場合は0点として処理される）
+                self._evaluate_conversation_async(is_final=True)
+
+            # リスニングテスト終了時も、会話が終わっていれば結果画面へ遷移したい
+            if test_id == "listening":
+                # ステータステキストを非表示にする
+                if "listening" in self.tab_status_texts:
+                    status_text = self.tab_status_texts["listening"]
+                    status_text.value = ""
+                    status_text.visible = False
+                    self.page.update()
+
+                if len(self.conversation_history) > 0 and not self.conversation_running:
+                    # 会話テストが既に終了している場合、再評価を行って結果画面を表示
+                    # 会話の評価は保存されているはずだが、TOEIC予測のために再実行（あるいは保存された結果を使用）
+                    # 簡便のため、会話評価を再実行して結果画面へ遷移させる
+                    self._evaluate_conversation_async(is_final=True)
+
+            # 文法テスト終了時も、会話が終わっていれば結果画面へ遷移したい
+            if test_id == "grammar":
+                # ステータステキストを非表示にする
+                if "grammar" in self.tab_status_texts:
+                    status_text = self.tab_status_texts["grammar"]
+                    status_text.value = ""
+                    status_text.visible = False
+                    self.page.update()
+
+                if len(self.conversation_history) > 0 and not self.conversation_running:
+                    # 会話テストが既に終了している場合、再評価を行って結果画面を表示
                     self._evaluate_conversation_async(is_final=True)
 
             # テスト実行中フラグを解除
@@ -2303,16 +2809,19 @@ class ConversationWindow:
         # ステータステキストを更新
         status_text = self.tab_status_texts[test_id]
         status_text.value = f"テスト実行中: {test_item['name']}"
-        status_text.color = ft.Colors.BLUE
+        status_text.color = ft.colors.BLUE
 
         self.page.update()
 
     def _format_conversation_history(self) -> str:
-        """会話履歴をテキスト形式に変換"""
+        """会話履歴とメモをテキスト形式に変換"""
         if not self.conversation_history:
             return ""
 
         lines: list[str] = []
+
+        # 会話履歴
+        lines.append("=== Conversation Transcript ===")
         for entry in self.conversation_history:
             role = entry.get("role", "")
             text = entry.get("text", "")
@@ -2321,7 +2830,52 @@ class ConversationWindow:
             elif role == "student":
                 lines.append(f"学生「{text}」")
 
+        # メモ情報（あれば追加）
+        if self.student_memos:
+            lines.append("\n=== Teacher's Notes (Observations during session) ===")
+            for memo in self.student_memos:
+                category = memo.get("category", "general")
+                note = memo.get("note", "")
+                lines.append(f"- [{category}] {note}")
+        else:
+            lines.append("\n(No specific notes recorded during the session)")
+
         return "\n".join(lines)
+
+    def _transition_to_result_screen(self, result_data: dict[str, Any]) -> None:
+        """結果画面へ遷移"""
+
+        def on_back():
+            # リソースのクリーンアップ
+            try:
+                # 音声サービスの停止
+                if self.audio_service:
+                    self.audio_service.stop_mic_monitoring()
+                    self.audio_service.stop_speaker_monitoring()
+
+                # タイマー停止
+                self.overall_timer_running = False
+                for timer_info in self.tab_timers.values():
+                    timer_info["running"] = False
+
+            except Exception as e:
+                print(f"Cleanup error during transition: {e}")
+
+            # セッションディレクトリをリセットして次のセッションの準備
+            self.current_session_dir = None
+
+            self.page.clean()
+
+            # 新しいConversationWindowインスタンスを作成して再構築
+            # これにより、すべての状態（スコア、履歴など）が初期化される
+            new_window = ConversationWindow(self.page)
+            new_window.build()
+
+            self.page.update()
+
+        # 結果画面を表示
+        result_window = ResultWindow(self.page, result_data, on_back)
+        result_window.build()
 
     def _evaluate_conversation_async(self, is_final: bool = False) -> None:
         """会話を非同期で評価（バックグラウンドで実行、音声処理をブロックしない）
@@ -2333,17 +2887,43 @@ class ConversationWindow:
         async def evaluate_async():
             """評価を非同期で実行"""
             try:
+                # 評価開始を表示
+                # print("評価プロセスを開始しました")
+                if "conversation" in self.tab_status_texts:
+                    self.tab_status_texts[
+                        "conversation"
+                    ].value = "会話を評価中...しばらくお待ちください"
+                    self.page.update()
+
                 # 会話履歴をテキスト形式に変換（メインスレッドから取得）
                 conversation_text = self._format_conversation_history()
+                # print(f"会話履歴テキスト長: {len(conversation_text)}")
+
                 if not conversation_text:
+                    # 履歴が空の場合でも、テストが実行されたなら結果画面へ遷移させる
+                    # print("会話履歴が空です")
+                    if is_final:
+                        result_data = {
+                            "grammar_score": 0,
+                            "vocabulary_score": 0,
+                            "naturalness_score": 0,
+                            "fluency_score": 0,
+                            "overall_score": 0,
+                            "predicted_toeic_score": None,
+                            "feedback": "会話履歴がありませんでした。マイクの接続を確認するか、もっと長く話してみてください。",
+                        }
+                        # print("結果画面へ遷移します（空の履歴）")
+                        self._transition_to_result_screen(result_data)
                     return
 
                 # 評価サービスを呼び出し（完全に非同期で実行、音声処理をブロックしない）
+                # print("OpenAI APIで評価を実行中...")
                 evaluation_result = (
                     await self.evaluation_service.openai_service.evaluate_conversation(
                         conversation_text
                     )
                 )
+                # print(f"評価結果を受信: {evaluation_result.keys()}")
 
                 # 評価結果を処理（スコアをグラフに追加、最終評価のみ表示）
                 if "error" not in evaluation_result:
@@ -2368,39 +2948,128 @@ class ConversationWindow:
                     # 折れ線グラフを更新（点数はグラフのみで表示、テキスト表示は削除）
                     self._update_score_chart()
 
-                    # 最終評価の場合、評価スコアと講評を画面下に表示
+                    # 最終評価の場合、結果画面へ遷移
+                    # ただし、リスニングと会話の両方が終わっている場合のみ
+                    # まだ終わっていないテストがある場合は、メッセージを表示するだけにするか、
+                    # あるいは「両方終わったら結果を表示します」と案内する
+
                     if is_final:
-                        self._display_evaluation_feedback(
-                            grammar_score,
-                            vocabulary_score,
-                            naturalness_score,
-                            fluency_score,
-                            overall_score,
-                            feedback,
-                        )
-                        # データを非同期で保存（UIをブロックしない）
-                        await self._save_conversation_data_async(
-                            grammar_score,
-                            vocabulary_score,
-                            naturalness_score,
-                            fluency_score,
-                            overall_score,
-                            feedback,
-                        )
+                        # 両方のテストが完了しているかチェック
+                        all_completed = self._check_all_tests_completed()
+                        # print(f"全テスト完了状態: {all_completed}")
+
+                        if all_completed:
+                            # 評価中のオーバーレイを表示
+                            # メインスレッドで実行する必要があるため、少しハッキーだが非同期関数内から同期的に呼び出す
+                            # UI更新はメインスレッドで行われる
+                            self._show_evaluating_overlay("TOEICスコアを判定中...")
+
+                            try:
+                                # TOEIC予測スコアの計算 (GPT-5による予測)
+                                # print("TOEICスコア予測を実行中...")
+                                # タイムアウト設定を追加（60秒）
+                                predicted_result = await asyncio.wait_for(
+                                    self.evaluation_service.predict_toeic_score(
+                                        conversation_text,
+                                        self.listening_results,
+                                        self.grammar_results,
+                                    ),
+                                    timeout=60.0,
+                                )
+                                predicted_toeic_score = predicted_result.get(
+                                    "predicted_score", 0
+                                )
+
+                                # 予測理由をフィードバックに追加
+                                reasoning = predicted_result.get("reasoning", "")
+                                if reasoning:
+                                    feedback += (
+                                        f"\n\n### TOEICスコア予測の根拠\n{reasoning}"
+                                    )
+                            except asyncio.TimeoutError:
+                                print("TOEICスコア予測がタイムアウトしました")
+                                feedback += (
+                                    "\n\n※TOEICスコア予測の処理がタイムアウトしました。"
+                                )
+                                predicted_toeic_score = 0
+                            except Exception as e:
+                                print(f"TOEICスコア予測エラー: {str(e)}")
+                                feedback += f"\n\n※TOEICスコア予測中にエラーが発生しました: {str(e)}"
+                                predicted_toeic_score = 0
+                            finally:
+                                # 必ずオーバーレイを消す
+                                self._hide_evaluating_overlay()
+
+                            result_data = {
+                                "grammar_score": grammar_score,
+                                "vocabulary_score": vocabulary_score,
+                                "naturalness_score": naturalness_score,
+                                "fluency_score": fluency_score,
+                                "overall_score": overall_score,
+                                "predicted_toeic_score": predicted_toeic_score,
+                                "feedback": feedback,
+                            }
+                            # print("結果画面へ遷移します（TOEIC予測あり）")
+                            self._transition_to_result_screen(result_data)
+
+                            # データを非同期で保存（UIをブロックしない）
+                            # print("データを保存中...")
+                            await self._save_conversation_data_async(
+                                grammar_score,
+                                vocabulary_score,
+                                naturalness_score,
+                                fluency_score,
+                                overall_score,
+                                feedback,
+                                predicted_toeic_score,
+                            )
+                        else:
+                            # 片方のテストしか終わっていない場合でも結果画面へ遷移
+                            # 会話テストのスコアだけ保存しておく
+                            # print("データを保存中（会話のみ）...")
+                            await self._save_conversation_data_async(
+                                grammar_score,
+                                vocabulary_score,
+                                naturalness_score,
+                                fluency_score,
+                                overall_score,
+                                feedback,
+                                None,  # まだTOEIC予測はしない
+                            )
+
+                            # 結果画面へ遷移
+                            result_data = {
+                                "grammar_score": grammar_score,
+                                "vocabulary_score": vocabulary_score,
+                                "naturalness_score": naturalness_score,
+                                "fluency_score": fluency_score,
+                                "overall_score": overall_score,
+                                "predicted_toeic_score": None,
+                                "feedback": feedback
+                                + "\n\n※リスニングまたは文法テストが未完了のため、TOEICスコア予測は表示されません。",
+                            }
+                            # print("結果画面へ遷移します（会話のみ）")
+                            self._transition_to_result_screen(result_data)
+
                 else:
                     error_msg = evaluation_result.get("error", "評価エラー")
+                    print(f"評価APIエラー: {error_msg}")
                     if "conversation" in self.tab_status_texts:
                         status_text = self.tab_status_texts["conversation"]
                         status_text.value = f"評価エラー: {error_msg}"
-                        status_text.color = ft.Colors.RED
+                        status_text.color = ft.colors.RED
                         self.page.update()
             except Exception as e:
-                print(f"会話評価エラー: {str(e)}")
+                print(f"会話評価例外発生: {str(e)}")
+                traceback.print_exc()
                 if "conversation" in self.tab_status_texts:
                     status_text = self.tab_status_texts["conversation"]
                     status_text.value = f"評価エラー: {str(e)}"
-                    status_text.color = ft.Colors.RED
+                    status_text.color = ft.colors.RED
                     self.page.update()
+            finally:
+                # 念のためオーバーレイを消す（もし残っていたら）
+                self._hide_evaluating_overlay()
 
         # 評価を非同期で実行（音声処理をブロックしない）
         # 既存のイベントループがある場合はタスクとしてスケジュール、ない場合は別スレッドで新しいループを実行
@@ -2488,17 +3157,17 @@ Please respond in JSON format:
                     # 既存の評価結果と統合して表示
                     if is_valid:
                         status_text.value = f"会話評価（Realtime API）: 成立（総合スコア: {overall_score:.1f}/100）\n{feedback}"
-                        status_text.color = ft.Colors.GREEN
+                        status_text.color = ft.colors.GREEN
                     else:
                         status_text.value = f"会話評価（Realtime API）: 不成立（総合スコア: {overall_score:.1f}/100）\n{feedback}"
-                        status_text.color = ft.Colors.ORANGE
+                        status_text.color = ft.colors.ORANGE
                     self.page.update()
             else:
                 # JSON形式でない場合は、テキスト全体をフィードバックとして使用
                 if "conversation" in self.tab_status_texts:
                     status_text = self.tab_status_texts["conversation"]
                     status_text.value = f"会話評価（Realtime API）: {text}"
-                    status_text.color = ft.Colors.BLUE
+                    status_text.color = ft.colors.BLUE
                     self.page.update()
         except json.JSONDecodeError as e:
             print(f"Realtime API評価結果のJSON解析エラー: {str(e)}")
@@ -2506,7 +3175,7 @@ Please respond in JSON format:
             if "conversation" in self.tab_status_texts:
                 status_text = self.tab_status_texts["conversation"]
                 status_text.value = f"会話評価（Realtime API）: {text}"
-                status_text.color = ft.Colors.BLUE
+                status_text.color = ft.colors.BLUE
                 self.page.update()
         except Exception as e:
             print(f"Realtime API評価結果の解析エラー: {str(e)}")
@@ -2608,6 +3277,28 @@ Please respond in JSON format:
         self.evaluation_feedback_text.visible = True
         self.page.update()
 
+    def _get_or_create_session_dir(self) -> Path:
+        """現在のセッション用の保存ディレクトリを取得または作成"""
+        if self.current_session_dir is not None and self.current_session_dir.exists():
+            return self.current_session_dir
+
+        # 保存ディレクトリを使用（選択された保存場所またはデフォルトのDesktop）
+        base_save_dir = self.save_directory
+        base_save_dir.mkdir(parents=True, exist_ok=True)
+
+        # フォルダ名を生成 TestRecord_YYYYMMDD_NNN
+        date_str = datetime.now().strftime("%Y%m%d")
+        existing_folders = list(base_save_dir.glob(f"TestRecord_{date_str}_*"))
+        folder_number = len(existing_folders) + 1
+        record_folder_name = f"TestRecord_{date_str}_{folder_number:03d}"
+
+        # レコードフォルダを作成
+        save_dir = base_save_dir / record_folder_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        self.current_session_dir = save_dir
+        return save_dir
+
     async def _save_conversation_data_async(
         self,
         grammar_score: float,
@@ -2616,34 +3307,26 @@ Please respond in JSON format:
         fluency_score: float,
         overall_score: float,
         feedback: str,
+        predicted_toeic_score: int | None = None,
     ) -> None:
         """会話データを非同期で保存（書き起こし、mp3、評価スコアと講評）
 
         このメソッドは非同期で実行され、UIをブロックしません。
         """
+        """conversation_window.py"""
         try:
-            # 保存ディレクトリを使用（選択された保存場所またはデフォルトのDesktop）
-            base_save_dir = self.save_directory
-            base_save_dir.mkdir(parents=True, exist_ok=True)
+            # 統合されたセッションディレクトリを取得
+            save_dir = self._get_or_create_session_dir()
 
             # テストIDを取得（会話テストの場合は"conversation"）
             test_id = self.current_test_id if self.current_test_id else "conversation"
+            # 常に"conversation"として保存することでファイル名を統一
+            if test_id != "conversation":
+                test_id = "conversation"
 
-            # TestRecord_テストID_YYYYMMDD_適当な番号というフォルダ名を生成
-            date_str = datetime.now().strftime("%Y%m%d")
-            # 同じ日付・同じテストIDのTestRecordフォルダ数をカウントして番号を決定
-            existing_folders = list(
-                base_save_dir.glob(f"TestRecord_{test_id}_{date_str}_*")
-            )
-            folder_number = len(existing_folders) + 1
-            record_folder_name = f"TestRecord_{test_id}_{date_str}_{folder_number:03d}"
-
-            # レコードフォルダを作成
-            save_dir = base_save_dir / record_folder_name
-            save_dir.mkdir(parents=True, exist_ok=True)
-
-            # ファイル名を生成（テストIDを含める）
-            base_filename = f"{test_id}_{date_str}_{folder_number:03d}"
+            # ファイル名を生成 (conversation.json)
+            # フォルダがタイムスタンプ付きでユニーク化されているため、ファイル名はシンプルで良い
+            base_filename = test_id
 
             # 会話の書き起こしを取得
             conversation_text = self._format_conversation_history()
@@ -2657,63 +3340,57 @@ Please respond in JSON format:
                     "naturalness_score": naturalness_score,
                     "fluency_score": fluency_score,
                     "overall_score": overall_score,
+                    "predicted_toeic_score": predicted_toeic_score,
                     "feedback": feedback,
                 },
                 "timestamp": datetime.now().isoformat(),
             }
 
-            # JSONファイルを非同期で保存
+            # JSONファイルを保存
             json_path = save_dir / f"{base_filename}.json"
             json_str = json.dumps(json_data, ensure_ascii=False, indent=2)
             async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
                 await f.write(json_str)
 
-            # AI音声をmp3に保存（CPU集約的な処理なので別スレッドで実行）
-            with self.ai_audio_recording_lock:
-                if len(self.ai_audio_recording_buffer) > 0:
-                    ai_audio_combined = np.concatenate(self.ai_audio_recording_buffer)
-                    ai_audio_path = save_dir / f"{base_filename}_ai.mp3"
-                    # float32形式の音声データをint16に変換
-                    ai_audio_int16 = (
-                        np.clip(ai_audio_combined, -1.0, 1.0) * 32767.0
-                    ).astype(np.int16)
-                    # numpy配列をAudioSegmentに変換してmp3として保存
-                    audio_segment = AudioSegment(
-                        ai_audio_int16.tobytes(),
-                        frame_rate=24000,
-                        channels=1,
-                        sample_width=2,  # int16 = 2 bytes
-                    )
-                    # CPU集約的な処理は別スレッドで実行（UIをブロックしない）
-                    await asyncio.to_thread(
-                        audio_segment.export, ai_audio_path, format="mp3", bitrate="64k"
-                    )
+            # 音声ファイルの保存
+            try:
+                # AI音声の保存
+                with self.ai_audio_recording_lock:
+                    if self.ai_audio_recording_buffer:
+                        ai_audio = np.concatenate(self.ai_audio_recording_buffer)
+                        ai_wav_path = save_dir / f"{base_filename}_ai.wav"
+                        # float32 -> int16変換
+                        ai_audio_int16 = (ai_audio * 32767).astype(np.int16)
+                        wavfile.write(str(ai_wav_path), 24000, ai_audio_int16)
+                        # print(f"AI音声を保存しました: {ai_wav_path}")
 
-            # 学生音声をmp3に保存（CPU集約的な処理なので別スレッドで実行）
-            with self.student_audio_recording_lock:
-                if len(self.student_audio_recording_buffer) > 0:
-                    student_audio_combined = np.concatenate(
-                        self.student_audio_recording_buffer
-                    )
-                    student_audio_path = save_dir / f"{base_filename}_student.mp3"
-                    # float32形式の音声データをint16に変換
-                    student_audio_int16 = (
-                        np.clip(student_audio_combined, -1.0, 1.0) * 32767.0
-                    ).astype(np.int16)
-                    # numpy配列をAudioSegmentに変換してmp3として保存
-                    audio_segment = AudioSegment(
-                        student_audio_int16.tobytes(),
-                        frame_rate=24000,
-                        channels=1,
-                        sample_width=2,  # int16 = 2 bytes
-                    )
-                    # CPU集約的な処理は別スレッドで実行（UIをブロックしない）
-                    await asyncio.to_thread(
-                        audio_segment.export,
-                        student_audio_path,
-                        format="mp3",
-                        bitrate="64k",
-                    )
+                # 学生音声の保存
+                with self.student_audio_recording_lock:
+                    if self.student_audio_recording_buffer:
+                        student_audio = np.concatenate(
+                            self.student_audio_recording_buffer
+                        )
+                        student_wav_path = save_dir / f"{base_filename}_student.wav"
+                        # float32 -> int16変換
+                        student_audio_int16 = (student_audio * 32767).astype(np.int16)
+                        wavfile.write(str(student_wav_path), 24000, student_audio_int16)
+                        # print(f"学生音声を保存しました: {student_wav_path}")
+            except Exception as e:
+                print(f"音声ファイルの保存エラー: {str(e)}")
+            if self.student_memos:
+                memo_path = save_dir / f"{base_filename}_memos.txt"
+                memo_content = "=== Teacher's Notes ===\n\n"
+                for memo in self.student_memos:
+                    category = memo.get("category", "general")
+                    note = memo.get("note", "")
+                    timestamp = memo.get("timestamp", "")
+                    memo_content += f"[{timestamp}] [{category}] {note}\n"
+
+                async with aiofiles.open(memo_path, "w", encoding="utf-8") as f:
+                    await f.write(memo_content)
+
+            # リスニング音声（もし一時ファイルがあれば）を移動
+            # Realtime APIの音声ログ保存は別途検討
 
             print(f"会話データを保存しました: {json_path}")
 
@@ -2726,7 +3403,7 @@ Please respond in JSON format:
                     status_text.value = f"会話セッション終了\n{save_message}"
                 else:
                     status_text.value = f"{status_text.value}\n{save_message}"
-                status_text.color = ft.Colors.GREY_700
+                status_text.color = ft.colors.GREY_700
                 # UIを更新
                 self.page.update()
 
@@ -2791,15 +3468,15 @@ Please respond in JSON format:
         tab_timer_text = ft.Text(
             "テスト時間: 00:00:00",
             size=14,
-            color=ft.Colors.BLACK,
+            color=ft.colors.BLACK,
             weight=ft.FontWeight.BOLD,
         )
 
         tab_timer_container = ft.Container(
             content=tab_timer_text,
             padding=8,
-            bgcolor=ft.Colors.WHITE,
-            border=ft.border.all(1, ft.Colors.GREY_400),
+            bgcolor=ft.colors.WHITE,
+            border=ft.border.all(1, ft.colors.GREY_400),
             border_radius=5,
         )
 
@@ -2815,7 +3492,7 @@ Please respond in JSON format:
         self.listening_status_text = ft.Text(
             "「テストを開始する」ボタンをクリックしてテストを開始してください",
             size=14,
-            color=ft.Colors.GREY_700,
+            color=ft.colors.GREY_700,
             text_align=ft.TextAlign.CENTER,
         )
         self.tab_status_texts[test_id] = self.listening_status_text
@@ -2888,8 +3565,14 @@ Please respond in JSON format:
             test_id
         )  # 共通の開始処理（タイマー開始など）
 
+        # スコアと結果をリセット
+        self.listening_score = 0
+        self.listening_question_count = 0
+        self.listening_results = []
+        self.listening_test_completed = False
+
         self.listening_status_text.value = "問題を作成中..."
-        self.listening_status_text.color = ft.Colors.BLUE
+        self.listening_status_text.color = ft.colors.BLUE
         self.page.update()
 
         # 非同期で問題生成を開始
@@ -2907,32 +3590,78 @@ Please respond in JSON format:
                 self.evaluation_service.openai_service.create_listening_question()
             )
             print(self.current_listening_text)
+            loop.close()
 
             if not self.current_listening_text:
                 self.listening_status_text.value = "問題生成に失敗しました。"
-                self.listening_status_text.color = ft.Colors.RED
+                self.listening_status_text.color = ft.colors.RED
                 self.page.update()
                 return
 
             # 2. パース
-            self.current_problem_info = self._parse_listening_problem(
+            self.listening_problems = self._parse_listening_problem(
                 self.current_listening_text
             )
-            # print(self.current_problem_info["answers"])  # TypeErrorになるため削除
-            if not self.current_problem_info:
+
+            if not self.listening_problems:
                 self.listening_status_text.value = "問題形式の解析に失敗しました。"
-                self.listening_status_text.color = ft.Colors.RED
+                self.listening_status_text.color = ft.colors.RED
                 self.page.update()
                 return
 
-            # 3. 音声生成（Passage部分のみ）
+            # インデックスをリセット
+            self.current_listening_index = 0
+
+            # 再生開始
+            self._play_current_listening_problem()
+
+        except Exception as e:
+            print(f"リスニングテストエラー: {e}")
+            self.listening_status_text.value = f"エラーが発生しました: {e}"
+            self.listening_status_text.color = ft.colors.RED
+            self.page.update()
+
+    def _play_current_listening_problem(self) -> None:
+        """現在のインデックスのリスニング問題を再生・表示する"""
+        try:
+            # 安全のため、既存の音声ストリームを強制停止
+            try:
+                sd.stop()
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"音声ストリーム強制停止エラー（無視可能）: {e}")
+
+            if not self.listening_problems or self.current_listening_index >= len(
+                self.listening_problems
+            ):
+                return
+
+            # 現在の問題情報をセット（互換性のため）
+            self.current_problem_info = [
+                self.listening_problems[self.current_listening_index]
+            ]
+
+            # 1. 問題表示（先読みのため）
+            self._display_listening_questions()
+            self.listening_status_text.value = f"問題を読んでください（10秒後に音声が流れます） ({self.current_listening_index + 1}/{len(self.listening_problems)})"
+            self.page.update()
+
+            # 読解時間計測開始
+            start_time = time.time()
+            reading_time_duration = 10.0
+
+            # 2. 音声生成（Passage部分のみ）
             passage_text = self.current_problem_info[0]["passage"]
             if not passage_text:
                 print("Error: Passage text is empty")
                 self.listening_status_text.value = "問題文が見つかりませんでした。"
-                self.listening_status_text.color = ft.Colors.RED
+                self.listening_status_text.color = ft.colors.RED
                 self.page.update()
                 return
+
+            # 新しいイベントループを作成（スレッド内で実行されるため）
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
             speech_file = Path(__file__).parent.parent.parent / "temp_speech.mp3"
             success = loop.run_until_complete(
@@ -2944,16 +3673,27 @@ Please respond in JSON format:
 
             if not success:
                 self.listening_status_text.value = "音声生成に失敗しました。"
-                self.listening_status_text.color = ft.Colors.RED
+                self.listening_status_text.color = ft.colors.RED
                 self.page.update()
                 return
 
+            # 3. 読解時間の残り時間を待機
+            elapsed_time = time.time() - start_time
+            if elapsed_time < reading_time_duration:
+                time.sleep(reading_time_duration - elapsed_time)
+
             # 4. 音声再生
-            self.listening_status_text.value = "音声再生中..."
+            self.listening_status_text.value = f"音声再生中... ({self.current_listening_index + 1}/{len(self.listening_problems)})"
             self.page.update()
 
             # pydubで再生
             sound = AudioSegment.from_mp3(str(speech_file))
+
+            # 一時ファイルを削除
+            try:
+                speech_file.unlink()
+            except Exception as e:
+                print(f"一時ファイル削除エラー: {e}")
 
             # サンプリングレートをAudioServiceの設定(44100Hz)に合わせる
             if sound.frame_rate != self.audio_service.sample_rate:
@@ -2969,15 +3709,14 @@ Please respond in JSON format:
 
             self.audio_service.play_audio(audio_data_float)
 
-            # 5. 問題表示
-            self._display_listening_questions()
-            self.listening_status_text.value = "回答してください"
+            # 5. ステータス更新
+            self.listening_status_text.value = f"回答してください ({self.current_listening_index + 1}/{len(self.listening_problems)})"
             self.page.update()
 
         except Exception as e:
-            print(f"リスニングテストエラー: {e}")
+            print(f"リスニングテスト再生エラー: {e}")
             self.listening_status_text.value = f"エラーが発生しました: {e}"
-            self.listening_status_text.color = ft.Colors.RED
+            self.listening_status_text.color = ft.colors.RED
             self.page.update()
 
     def _parse_listening_problem(self, text: str) -> list[dict]:
@@ -3021,7 +3760,7 @@ Please respond in JSON format:
                     ft.Radio(
                         value=label_char,  # 値は常に A, B, C, D ...
                         label=f"{label_char}. {opt}"
-                        if not opt.strip().startswith(tuple(labels))
+                        if not opt.strip().startswith(f"{label_char}.")
                         else opt,  # ラベル表示
                     )
                 )
@@ -3037,7 +3776,7 @@ Please respond in JSON format:
                 ft.Container(
                     content=ft.Column([q_text, options_group]),
                     padding=10,
-                    border=ft.border.all(1, ft.Colors.GREY_300),
+                    border=ft.border.all(1, ft.colors.GREY_300),
                     border_radius=5,
                     margin=ft.margin.only(bottom=10),
                 )
@@ -3076,11 +3815,22 @@ Please respond in JSON format:
 
             if is_correct:
                 score += 1
-                result_color = ft.Colors.GREEN
+                result_color = ft.colors.GREEN
                 result_text = "Correct!"
             else:
-                result_color = ft.Colors.RED
+                result_color = ft.colors.RED
                 result_text = f"Incorrect. Answer: {correct_ans}"
+
+            # 結果を保存
+            self.listening_results.append(
+                {
+                    "question": problem["question"],
+                    "options": problem["options"],
+                    "correct_answer": correct_ans,
+                    "user_answer": user_ans,
+                    "is_correct": is_correct,
+                }
+            )
 
             feedback_controls.append(
                 ft.Text(
@@ -3089,11 +3839,17 @@ Please respond in JSON format:
                 )
             )
 
+        # 全体のスコアを更新
+        self.listening_score += score
+        self.listening_question_count += len(problems)
+
         # 結果表示
         self.question_display.controls.append(ft.Divider())
         self.question_display.controls.append(
             ft.Text(
-                f"Score: {score}/{len(problems)}", size=20, weight=ft.FontWeight.BOLD
+                f"Score: {score}/{len(problems)} (Total: {self.listening_score}/{self.listening_question_count})",
+                size=20,
+                weight=ft.FontWeight.BOLD,
             )
         )
         self.question_display.controls.extend(feedback_controls)
@@ -3110,10 +3866,493 @@ Please respond in JSON format:
         """次の問題へボタンクリック時"""
         self.next_question_button.visible = False
         self.question_display.controls.clear()
-        self.listening_status_text.value = "次の問題を作成中..."
+
+        # インデックスを進める
+        self.current_listening_index += 1
+
+        # まだ問題がある場合
+        if self.listening_problems and self.current_listening_index < len(
+            self.listening_problems
+        ):
+            self.listening_status_text.value = "次の問題を準備中..."
+            self.page.update()
+
+            # 別スレッドで再生開始
+            threading.Thread(
+                target=self._play_current_listening_problem, daemon=True
+            ).start()
+        else:
+            # 全問終了した場合
+            self.listening_status_text.value = (
+                "すべての問題が終了しました。お疲れ様でした。"
+            )
+            self.listening_status_text.color = ft.colors.GREEN
+
+            # テスト終了ボタンを表示
+            finish_button = ft.ElevatedButton(
+                "テストを終了してメイン画面へ戻る",
+                on_click=self._on_listening_finish_clicked,
+                bgcolor=ft.colors.BLUE_400,
+                color=ft.colors.WHITE,
+                width=300,
+                height=50,
+            )
+
+            self.question_display.controls.append(ft.Container(height=20))
+            self.question_display.controls.append(
+                ft.Container(
+                    content=finish_button,
+                    alignment=ft.alignment.center,
+                )
+            )
+
+            # 結果を非同期で保存
+            asyncio.create_task(self._save_listening_data_async())
+
+            self.page.update()
+
+    async def _save_listening_data_async(self) -> None:
+        """リスニングテストの結果を非同期で保存"""
+        try:
+            # 統合されたセッションディレクトリを取得
+            save_dir = self._get_or_create_session_dir()
+            test_id = "listening"
+
+            # ファイル名を生成 (listening.json)
+            base_filename = test_id
+
+            # JSONデータを作成
+            json_data = {
+                "score": self.listening_score,
+                "total_questions": self.listening_question_count,
+                "percentage": (
+                    self.listening_score / self.listening_question_count * 100
+                )
+                if self.listening_question_count > 0
+                else 0,
+                "results": self.listening_results,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            # JSONファイルを保存
+            json_path = save_dir / f"{base_filename}.json"
+            json_str = json.dumps(json_data, ensure_ascii=False, indent=2)
+            async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
+                await f.write(json_str)
+
+            print(f"リスニングテストの結果を保存しました: {json_path}")
+
+        except Exception as e:
+            print(f"リスニングテスト結果の保存エラー: {str(e)}")
+            traceback.print_exc()
+
+    def _on_listening_finish_clicked(self, e: ft.ControlEvent) -> None:
+        """リスニングテスト終了ボタンクリック時の処理"""
+        # テスト完了フラグを設定
+        self.listening_test_completed = True
+
+        # タイマーを停止
+        self._stop_test_timer("listening")
+
+        # メイン画面へ戻る
+        if self.tabs:
+            self.tabs.selected_index = 0
+            # タブ変更イベントを手動でトリガー
+            self._on_tab_changed(
+                ft.ControlEvent(
+                    target="tabs",
+                    name="change",
+                    data="0",
+                    control=self.tabs,
+                    page=self.page,
+                )
+            )
+            self.page.update()
+
+    def _create_grammar_test_content(self) -> ft.Container:
+        """文法テストタブのコンテンツを作成"""
+        test_id = "grammar"
+
+        # タブ内のタイマー
+        tab_timer_text = ft.Text(
+            "テスト時間: 00:00:00",
+            size=14,
+            color=ft.colors.BLACK,
+            weight=ft.FontWeight.BOLD,
+        )
+
+        tab_timer_container = ft.Container(
+            content=tab_timer_text,
+            padding=8,
+            bgcolor=ft.colors.WHITE,
+            border=ft.border.all(1, ft.colors.GREY_400),
+            border_radius=5,
+        )
+
+        # タブ内タイマーを初期化
+        self.tab_timers[test_id] = {
+            "start_time": None,
+            "running": False,
+            "text": tab_timer_text,
+            "thread": None,
+            "final_time": None,
+        }
+
+        self.grammar_status_text = ft.Text(
+            "「テストを開始する」ボタンをクリックしてテストを開始してください",
+            size=14,
+            color=ft.colors.GREY_700,
+            text_align=ft.TextAlign.CENTER,
+        )
+        self.tab_status_texts[test_id] = self.grammar_status_text
+
+        # 問題表示用エリア
+        self.grammar_question_display = ft.Column(
+            controls=[],
+            scroll=ft.ScrollMode.AUTO,
+        )
+
+        # 「テストを開始する」ボタン
+        start_button = ft.ElevatedButton(
+            "テストを開始する",
+            on_click=lambda e: self._on_grammar_test_start_clicked(),
+            width=250,
+            height=45,
+        )
+        self.tab_start_buttons[test_id] = start_button
+
+        # 次の問題へ進むボタン
+        self.next_grammar_question_button = ft.ElevatedButton(
+            "次の問題へ",
+            on_click=lambda e: self._on_grammar_test_next_clicked(),
+            width=250,
+            height=45,
+            visible=False,
+        )
+
+        content = ft.Container(
+            content=ft.Stack(
+                [
+                    ft.Column(
+                        [
+                            ft.Container(height=20),
+                            ft.Text("文法テスト", size=24, weight=ft.FontWeight.BOLD),
+                            ft.Container(height=10),
+                            self.grammar_status_text,
+                            ft.Container(height=20),
+                            self.grammar_question_display,
+                            ft.Container(height=20),
+                            ft.Row(
+                                [start_button, self.next_grammar_question_button],
+                                alignment=ft.MainAxisAlignment.CENTER,
+                            ),
+                            ft.Container(height=20),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        expand=True,
+                    ),
+                    ft.Container(
+                        content=tab_timer_container,
+                        right=20,
+                        top=20,
+                    ),
+                ],
+                expand=True,
+            ),
+            padding=40,
+            expand=True,
+        )
+        return content
+
+    def _on_grammar_test_start_clicked(self) -> None:
+        """文法テスト開始ボタンクリック時の処理"""
+        test_id = "grammar"
+        self._on_test_start_button_clicked(test_id)
+
+        # スコアと結果をリセット
+        self.grammar_score = 0
+        self.grammar_question_count = 0
+        self.grammar_results = []
+        self.grammar_test_completed = False
+        self.grammar_problems = []
+
+        self.grammar_status_text.value = "問題を作成中..."
+        self.grammar_status_text.color = ft.colors.BLUE
         self.page.update()
 
-        # 再度問題生成プロセスを開始
+        # 非同期で問題生成を開始
         threading.Thread(
-            target=self._generate_and_start_listening_question, daemon=True
+            target=self._generate_and_start_grammar_question, daemon=True
         ).start()
+
+    def _generate_and_start_grammar_question(self) -> None:
+        """文法問題を生成して表示する処理（別スレッド実行）"""
+        try:
+            # 問題文生成
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            grammar_json = loop.run_until_complete(
+                self.evaluation_service.openai_service.create_grammar_question()
+            )
+            print(grammar_json)
+            loop.close()
+
+            if not grammar_json:
+                self.grammar_status_text.value = "問題生成に失敗しました。"
+                self.grammar_status_text.color = ft.colors.RED
+                self.page.update()
+                return
+
+            # パース
+            try:
+                data = json.loads(grammar_json)
+                self.grammar_problems = data.get("questions", [])
+            except json.JSONDecodeError as e:
+                print(f"JSON Parse Error: {e}")
+                self.grammar_problems = []
+
+            if not self.grammar_problems:
+                self.grammar_status_text.value = "問題形式の解析に失敗しました。"
+                self.grammar_status_text.color = ft.colors.RED
+                self.page.update()
+                return
+
+            # インデックスをリセット
+            self.current_grammar_index = 0
+
+            # 最初の問題を表示
+            self._display_grammar_question()
+
+        except Exception as e:
+            print(f"文法テストエラー: {e}")
+            self.grammar_status_text.value = f"エラーが発生しました: {e}"
+            self.grammar_status_text.color = ft.colors.RED
+            self.page.update()
+
+    def _display_grammar_question(self) -> None:
+        """現在の文法問題を表示する"""
+        if not self.grammar_problems or self.current_grammar_index >= len(
+            self.grammar_problems
+        ):
+            return
+
+        self.grammar_question_display.controls.clear()
+        self.grammar_answer_value = None  # 回答保持用
+
+        problem = self.grammar_problems[self.current_grammar_index]
+        self.grammar_status_text.value = f"回答してください ({self.current_grammar_index + 1}/{len(self.grammar_problems)})"
+
+        q_text = ft.Text(
+            f"Q{self.current_grammar_index + 1}. {problem['question']}",
+            size=18,
+            weight=ft.FontWeight.BOLD,
+        )
+
+        options_controls = []
+        labels = ["A", "B", "C", "D"]
+
+        for j, opt in enumerate(problem["options"]):
+            label_char = labels[j] if j < len(labels) else chr(65 + j)
+            options_controls.append(
+                ft.Radio(
+                    value=label_char,
+                    label=f"{label_char}. {opt}"
+                    if not opt.strip().startswith(f"{label_char}.")
+                    else opt,
+                )
+            )
+
+        options_group = ft.RadioGroup(
+            content=ft.Column(options_controls),
+            on_change=self._on_grammar_answer_changed,
+        )
+
+        self.grammar_question_display.controls.append(
+            ft.Container(
+                content=ft.Column([q_text, ft.Container(height=10), options_group]),
+                padding=20,
+                border=ft.border.all(1, ft.colors.GREY_300),
+                border_radius=5,
+                margin=ft.margin.only(bottom=20),
+            )
+        )
+
+        # 回答ボタン
+        self.grammar_submit_btn = ft.ElevatedButton(
+            "回答する", on_click=self._on_grammar_submit_clicked
+        )
+        self.grammar_question_display.controls.append(
+            ft.Container(content=self.grammar_submit_btn, padding=10)
+        )
+
+        self.page.update()
+
+    def _on_grammar_answer_changed(self, e: ft.ControlEvent) -> None:
+        """ラジオボタンの選択変更時"""
+        self.grammar_answer_value = e.data
+
+    def _on_grammar_submit_clicked(self, e: ft.ControlEvent) -> None:
+        """回答ボタンクリック時"""
+        if not self.grammar_problems:
+            return
+
+        user_ans = self.grammar_answer_value
+        if not user_ans:
+            return  # 未選択の場合は何もしない
+
+        problem = self.grammar_problems[self.current_grammar_index]
+        correct_ans = problem["answer"]
+        is_correct = user_ans == correct_ans
+        explanation = problem.get("explanation", "")
+
+        score = 1 if is_correct else 0
+        if is_correct:
+            result_color = ft.colors.GREEN
+            result_text = "Correct!"
+        else:
+            result_color = ft.colors.RED
+            result_text = f"Incorrect. Answer: {correct_ans}"
+
+        # 結果を保存
+        self.grammar_results.append(
+            {
+                "question": problem["question"],
+                "options": problem["options"],
+                "correct_answer": correct_ans,
+                "user_answer": user_ans,
+                "is_correct": is_correct,
+                "explanation": explanation,
+            }
+        )
+
+        self.grammar_score += score
+        self.grammar_question_count += 1
+
+        # フィードバック表示
+        self.grammar_question_display.controls.append(ft.Divider())
+        self.grammar_question_display.controls.append(
+            ft.Text(
+                result_text,
+                size=18,
+                weight=ft.FontWeight.BOLD,
+                color=result_color,
+            )
+        )
+        if explanation:
+            self.grammar_question_display.controls.append(
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text("解説:", weight=ft.FontWeight.BOLD),
+                            ft.Text(explanation),
+                        ]
+                    ),
+                    padding=10,
+                    bgcolor=ft.colors.BLUE_50,
+                    border_radius=5,
+                )
+            )
+
+        # ボタンを無効化
+        e.control.disabled = True
+
+        # 次の問題へボタンを表示
+        self.next_grammar_question_button.visible = True
+
+        self.page.update()
+
+    def _on_grammar_test_next_clicked(self) -> None:
+        """次の問題へボタンクリック時"""
+        self.next_grammar_question_button.visible = False
+
+        # インデックスを進める
+        self.current_grammar_index += 1
+
+        # まだ問題がある場合
+        if self.grammar_problems and self.current_grammar_index < len(
+            self.grammar_problems
+        ):
+            self._display_grammar_question()
+        else:
+            # 全問終了した場合
+            self.grammar_question_display.controls.clear()
+            self.grammar_status_text.value = (
+                "すべての問題が終了しました。お疲れ様でした。"
+            )
+            self.grammar_status_text.color = ft.colors.GREEN
+
+            # 最終結果表示
+            percentage = (self.grammar_score / self.grammar_question_count) * 100
+            self.grammar_question_display.controls.append(
+                ft.Column(
+                    [
+                        ft.Text(
+                            f"最終スコア: {self.grammar_score}/{self.grammar_question_count} ({percentage:.1f}%)",
+                            size=24,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        ft.Container(height=20),
+                        ft.ElevatedButton(
+                            "テストを終了してメイン画面へ戻る",
+                            on_click=self._on_grammar_finish_clicked,
+                            bgcolor=ft.colors.BLUE_400,
+                            color=ft.colors.WHITE,
+                            width=300,
+                            height=50,
+                        ),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                )
+            )
+
+            # 結果を非同期で保存
+            asyncio.create_task(self._save_grammar_data_async())
+
+            self.page.update()
+
+    async def _save_grammar_data_async(self) -> None:
+        """文法テストの結果を非同期で保存"""
+        try:
+            save_dir = self._get_or_create_session_dir()
+            test_id = "grammar"
+            base_filename = test_id
+
+            json_data = {
+                "score": self.grammar_score,
+                "total_questions": self.grammar_question_count,
+                "percentage": (self.grammar_score / self.grammar_question_count * 100)
+                if self.grammar_question_count > 0
+                else 0,
+                "results": self.grammar_results,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            json_path = save_dir / f"{base_filename}.json"
+            json_str = json.dumps(json_data, ensure_ascii=False, indent=2)
+            async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
+                await f.write(json_str)
+
+            print(f"文法テストの結果を保存しました: {json_path}")
+
+        except Exception as e:
+            print(f"文法テスト結果の保存エラー: {str(e)}")
+            traceback.print_exc()
+
+    def _on_grammar_finish_clicked(self, e: ft.ControlEvent) -> None:
+        """文法テスト終了ボタンクリック時の処理"""
+        self.grammar_test_completed = True
+        self._stop_test_timer("grammar")
+
+        # メイン画面へ戻る
+        if self.tabs:
+            self.tabs.selected_index = 0
+            self._on_tab_changed(
+                ft.ControlEvent(
+                    target="tabs",
+                    name="change",
+                    data="0",
+                    control=self.tabs,
+                    page=self.page,
+                )
+            )
+            self.page.update()
