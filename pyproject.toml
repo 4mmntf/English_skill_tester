@@ -3,7 +3,7 @@ name = "english-skill-app"
 version = "0.1.0"
 description = "英会話能力測定AIアプリ"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "flet[all]==0.25.0",
     "openai>=1.12.0",
@@ -11,12 +11,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pydantic>=2.5.3",
     "pydantic-settings>=2.1.0",
-    "pyinstaller>=6.3.0",
+    "pyinstaller>=6.15.0",
     "sounddevice>=0.4.6",
     "numpy>=1.26.0",
     "pydub>=0.25.1",
-    "audioop-lts>=0.2.2",  # Python 3.13+でaudioopの代替として必要
-    "aiofiles>=23.2.0",  # 非同期ファイルI/O
+    "audioop-lts>=0.2.2", # Python 3.13+でaudioopの代替として必要
+    "aiofiles>=23.2.0", # 非同期ファイルI/O
     "duckduckgo-search>=8.1.1",
     "scipy>=1.17.0",
 ]

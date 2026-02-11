@@ -19,6 +19,17 @@ from dotenv import load_dotenv
 if getattr(sys, 'frozen', False):
     # PyInstallerでビルドされた場合
     application_path = Path(sys.executable).parent
+    
+    # Fletクライアントの正しいパスを設定 (onedirモード)
+    # PyInstallerはfletファイルを _internal/flet に配置する
+    flet_path = application_path / '_internal' / 'flet'
+    if flet_path.exists():
+        # get_package_bin_dir()が正しいパスを返すようにモンキーパッチ
+        import flet_desktop
+        def patched_get_package_bin_dir():
+            return str(flet_path.parent)
+        flet_desktop.get_package_bin_dir = patched_get_package_bin_dir
+        print(f"Flet client path set to: {flet_path.parent}")
 else:
     # 開発環境の場合
     application_path = Path(__file__).parent.parent

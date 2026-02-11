@@ -3,23 +3,29 @@
 block_cipher = None
 
 a = Analysis(
-    ['app/main.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('.venv/Lib/site-packages/flet_desktop/app/flet', 'flet'),
+    ],
     hiddenimports=[
-        'customtkinter',
         'openai',
         'azure.cognitiveservices.speech',
-        'msal',
         'pydantic',
         'pydantic_settings',
         'dotenv',
+        'flet.core',
+        'flet.core.page',
+        'flet.core.control',
+        'flet.core.event',
+        'flet.utils',
+        'flet_desktop',
     ],
-    hookspath=[],
+    hookspath=['hooks'],
     hooksconfig={},
+    excludes=['flet_cli.__pyinstaller'],
     runtime_hooks=[],
-    excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -31,23 +37,40 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='EnglishSkillApp',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,  # GUIアプリなのでコンソールを表示しない
     disable_windowed_traceback=False,
-    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon=None,  # アイコンファイルがある場合は指定
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='EnglishSkillApp',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='EnglishSkillApp',
 )
 
