@@ -39,6 +39,165 @@ class ResultWindow:
         """ウィジェットの構築"""
         self.page.clean()
 
+        # 結果データの種類をチェック
+        has_conversation = "overall_score" in self.result_data
+        has_listening = "listening_results" in self.result_data
+
+        # 両方のデータがある場合はタブで表示（総合結果として）
+        if has_conversation and has_listening:
+            self._build_combined_result()
+        elif has_listening:
+            self._build_listening_result()
+        else:
+            self._build_conversation_result()
+
+    def _build_combined_result(self) -> None:
+        """総合結果画面（タブ表示）の構築"""
+        title = ft.Text(
+            "総合テスト結果",
+            size=32,
+            weight=ft.FontWeight.BOLD,
+            text_align=ft.TextAlign.CENTER,
+            color=ft.colors.BLACK,
+        )
+
+        # 会話（総合）タブの内容
+        conversation_content = self._create_conversation_content_container()
+
+        # リスニングタブの内容
+        listening_content = self._create_listening_content_container()
+
+        # タブの作成
+        tabs = ft.Tabs(
+            selected_index=0,
+            animation_duration=300,
+            tabs=[
+                ft.Tab(
+                    text="総合スコア・会話評価",
+                    content=conversation_content,
+                ),
+                ft.Tab(
+                    text="リスニング詳細",
+                    content=listening_content,
+                ),
+            ],
+            expand=True,
+        )
+
+        # 戻るボタン
+        back_button = ft.ElevatedButton(
+            "メイン画面に戻る",
+            on_click=self._on_back_clicked,
+            width=200,
+            height=50,
+            bgcolor=ft.colors.BLUE_400,
+            color=ft.colors.WHITE,
+        )
+
+        content = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Container(height=20),
+                    title,
+                    ft.Container(height=20),
+                    tabs,
+                    ft.Container(height=20),
+                    back_button,
+                    ft.Container(height=20),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                expand=True,
+            ),
+            padding=20,
+            expand=True,
+            bgcolor=ft.colors.WHITE,
+        )
+
+        self.page.add(content)
+        self.page.update()
+
+    def _create_conversation_content_container(self) -> ft.Container:
+        """会話（総合）結果のコンテナを作成（スクロール可能）"""
+        score_chart = self._create_score_chart()
+        score_details = self._create_score_details()
+        feedback_section = self._create_feedback_section()
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Container(height=30),
+                    ft.Row(
+                        [
+                            score_chart,
+                            ft.Container(width=40),
+                            score_details,
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    ),
+                    ft.Container(height=30),
+                    feedback_section,
+                    ft.Container(height=30),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            padding=20,
+            expand=True,
+        )
+
+    def _create_listening_content_container(self) -> ft.Container:
+        """リスニング結果のコンテナを作成（スクロール可能）"""
+        score = self.result_data.get("listening_score", 0)
+        total = self.result_data.get("listening_question_count", 0)
+        percentage = (score / total * 100) if total > 0 else 0
+
+        score_display = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("リスニング正解率", size=18, color=ft.colors.GREY_700),
+                    ft.Text(
+                        f"{percentage:.1f}%",
+                        size=48,
+                        weight=ft.FontWeight.BOLD,
+                        color=ft.colors.BLUE_600
+                        if percentage >= 60
+                        else ft.colors.RED_400,
+                    ),
+                    ft.Text(
+                        f"{score} / {total} 問正解", size=20, weight=ft.FontWeight.BOLD
+                    ),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=20,
+            border=ft.border.all(1, ft.colors.GREY_300),
+            border_radius=10,
+            bgcolor=ft.colors.WHITE,
+        )
+
+        review_section = self._create_listening_review_section()
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Container(height=20),
+                    score_display,
+                    ft.Container(height=30),
+                    ft.Text("復習・スクリプト確認", size=24, weight=ft.FontWeight.BOLD),
+                    ft.Container(height=10),
+                    review_section,
+                    ft.Container(height=30),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            padding=20,
+            expand=True,
+        )
+
+    def _build_conversation_result(self) -> None:
+        """会話テスト結果画面の構築"""
         # タイトル
         title = ft.Text(
             "会話テスト結果",
@@ -59,7 +218,7 @@ class ResultWindow:
 
         # 戻るボタン
         back_button = ft.ElevatedButton(
-            "会話画面に戻る",
+            "メイン画面に戻る",
             on_click=self._on_back_clicked,
             width=200,
             height=50,
@@ -98,6 +257,211 @@ class ResultWindow:
 
         self.page.add(content)
         self.page.update()
+
+    def _build_listening_result(self) -> None:
+        """リスニングテスト結果画面の構築"""
+        # タイトル
+        title = ft.Text(
+            "リスニングテスト結果",
+            size=32,
+            weight=ft.FontWeight.BOLD,
+            text_align=ft.TextAlign.CENTER,
+            color=ft.colors.BLACK,
+        )
+
+        score = self.result_data.get("listening_score", 0)
+        total = self.result_data.get("listening_question_count", 0)
+        percentage = (score / total * 100) if total > 0 else 0
+
+        # スコア表示
+        score_display = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("正解率", size=18, color=ft.colors.GREY_700),
+                    ft.Text(
+                        f"{percentage:.1f}%",
+                        size=48,
+                        weight=ft.FontWeight.BOLD,
+                        color=ft.colors.BLUE_600
+                        if percentage >= 60
+                        else ft.colors.RED_400,
+                    ),
+                    ft.Text(
+                        f"{score} / {total} 問正解", size=20, weight=ft.FontWeight.BOLD
+                    ),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=20,
+            border=ft.border.all(1, ft.colors.GREY_300),
+            border_radius=10,
+            bgcolor=ft.colors.WHITE,
+        )
+
+        # パッセージと問題の表示エリア
+        review_section = self._create_listening_review_section()
+
+        # 戻るボタン
+        back_button = ft.ElevatedButton(
+            "メイン画面に戻る",
+            on_click=self._on_back_clicked,
+            width=200,
+            height=50,
+            bgcolor=ft.colors.BLUE_400,
+            color=ft.colors.WHITE,
+        )
+
+        content = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Container(height=20),
+                    title,
+                    ft.Container(height=20),
+                    score_display,
+                    ft.Container(height=30),
+                    ft.Text("復習・スクリプト確認", size=24, weight=ft.FontWeight.BOLD),
+                    ft.Container(height=10),
+                    review_section,
+                    ft.Container(height=30),
+                    back_button,
+                    ft.Container(height=20),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            padding=40,
+            expand=True,
+            bgcolor=ft.colors.WHITE,
+        )
+
+        self.page.add(content)
+        self.page.update()
+
+    def _create_listening_review_section(self) -> ft.Container:
+        """リスニングのスクリプトと問題ごとの詳細を作成"""
+        passages = self.result_data.get("listening_passages", [])
+        results = self.result_data.get("listening_results", [])
+
+        # 結果をパッセージごとにグループ化
+        # resultsの各アイテムには passage_index が含まれていると仮定
+        results_by_passage = {}
+        for res in results:
+            p_idx = res.get("passage_index", 0)
+            if p_idx not in results_by_passage:
+                results_by_passage[p_idx] = []
+            results_by_passage[p_idx].append(res)
+
+        content_controls = []
+
+        for i, passage_data in enumerate(passages):
+            passage_text = passage_data.get("passage", "")
+            passage_questions = results_by_passage.get(i, [])
+
+            # パッセージ表示
+            content_controls.append(
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                f"Passage {i + 1}",
+                                size=18,
+                                weight=ft.FontWeight.BOLD,
+                                color=ft.colors.BLUE_800,
+                            ),
+                            ft.Container(height=10),
+                            ft.Markdown(
+                                passage_text,
+                                selectable=True,
+                            ),
+                        ]
+                    ),
+                    padding=20,
+                    bgcolor=ft.colors.GREY_50,
+                    border_radius=10,
+                    border=ft.border.all(1, ft.colors.GREY_200),
+                )
+            )
+            content_controls.append(ft.Container(height=20))
+
+            # このパッセージに関連する問題の表示
+            for q_idx, res in enumerate(passage_questions):
+                is_correct = res.get("is_correct", False)
+                user_ans = res.get("user_answer", "-")
+                correct_ans = res.get("correct_answer", "-")
+                question_text = res.get("question", "")
+                options = res.get("options", [])
+
+                # アイコンと色設定
+                status_icon = ft.icons.CHECK_CIRCLE if is_correct else ft.icons.CANCEL
+                status_color = ft.colors.GREEN if is_correct else ft.colors.RED
+
+                # 選択肢の表示文字列作成
+                options_display = []
+                labels = ["A", "B", "C", "D"]
+                for j, opt in enumerate(options):
+                    label_char = labels[j] if j < len(labels) else "?"
+                    # 正解の選択肢を強調
+                    is_this_correct = label_char == correct_ans
+                    # ユーザーが間違えて選んだ選択肢を強調
+                    is_this_wrong_choice = label_char == user_ans and not is_correct
+
+                    opt_color = ft.colors.BLACK
+                    weight = ft.FontWeight.NORMAL
+
+                    if is_this_correct:
+                        opt_color = ft.colors.GREEN_700
+                        weight = ft.FontWeight.BOLD
+                        opt = f"{opt} (Correct)"
+                    elif is_this_wrong_choice:
+                        opt_color = ft.colors.RED_700
+                        opt = f"{opt} (Your Answer)"
+
+                    options_display.append(
+                        ft.Text(f"{label_char}. {opt}", color=opt_color, weight=weight)
+                    )
+
+                # 問題カード
+                question_card = ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Icon(status_icon, color=status_color, size=30),
+                            ft.Container(width=15),
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        f"Q{q_idx + 1}. {question_text}",
+                                        weight=ft.FontWeight.BOLD,
+                                        size=16,
+                                    ),
+                                    ft.Container(height=5),
+                                    ft.Column(options_display, spacing=2),
+                                    ft.Container(height=5),
+                                    ft.Text(
+                                        f"正解: {correct_ans} / あなたの回答: {user_ans}",
+                                        color=ft.colors.GREY_700,
+                                    ),
+                                ],
+                                expand=True,
+                            ),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    ),
+                    padding=15,
+                    border=ft.border.all(
+                        1, ft.colors.GREY_200 if is_correct else ft.colors.RED_100
+                    ),
+                    bgcolor=ft.colors.WHITE if is_correct else ft.colors.RED_50,
+                    border_radius=8,
+                )
+                content_controls.append(question_card)
+                content_controls.append(ft.Container(height=10))
+
+            content_controls.append(ft.Divider(height=40, color=ft.colors.GREY_400))
+
+        return ft.Container(
+            content=ft.Column(content_controls),
+            width=800,
+        )
 
     def _create_score_chart(self) -> ft.Container:
         """レーダーチャート風の表示（FletにRadarChartがないので棒グラフで代用）を作成"""
@@ -175,7 +539,7 @@ class ResultWindow:
         rows = []
 
         # TOEIC予測スコア表示（存在する場合）
-        predicted_toeic = self.result_data.get("predicted_toeic_score")
+        predicted_toeic = self.result_data.get("predicted_total_score")
         if predicted_toeic is not None:
             rows.append(
                 ft.Container(

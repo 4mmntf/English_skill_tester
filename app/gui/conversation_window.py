@@ -32,12 +32,19 @@ from app.gui.result_window import ResultWindow
 class ConversationWindow:
     """会話画面のウィンドウクラス"""
 
-    def __init__(self, page: ft.Page) -> None:
+    def __init__(
+        self,
+        page: ft.Page,
+        session_dir: Path | None = None,
+        save_dir: Path | None = None,
+    ) -> None:
         """
         初期化処理
 
         Args:
             page: Fletのページオブジェクト
+            session_dir: 復元するセッションディレクトリ（指定された場合）
+            save_dir: 保存先ディレクトリ（指定された場合）
         """
         self.page = page
 
@@ -50,7 +57,7 @@ class ConversationWindow:
         self.search_service: SearchService = SearchService()
 
         # 現在のテストセッションの保存ディレクトリ（会話とリスニングで共有）
-        self.current_session_dir: Path | None = None
+        self.current_session_dir: Path | None = session_dir
 
         # テスト項目の定義（メイン画面を最初に追加）
         self.test_items: list[dict[str, str]] = [
@@ -233,7 +240,7 @@ class ConversationWindow:
         self.is_monitoring_audio: bool = False  # 音声監視中フラグ（スレッド制御用）
 
         # 保存場所の設定（デフォルトはDesktop）
-        self.save_directory: Path = Path.home() / "Desktop"
+        self.save_directory: Path = save_dir if save_dir else (Path.home() / "Desktop")
         self.save_directory_picker: ft.FilePicker | None = (
             None  # 保存場所選択用のFilePicker
         )
@@ -242,12 +249,30 @@ class ConversationWindow:
             None  # 保存場所選択ボタン
         )
 
+        # 履歴リストコンポーネント
+        self.history_list: ft.ListView | None = None
+
         # 無音検知タイマー
         self.silence_timer: threading.Timer | None = None
         self.silence_timeout_seconds: float = 15.0  # 15秒間無音なら質問を変える
 
     def _show_evaluating_overlay(self, message: str) -> None:
         """評価中のオーバーレイを表示（画面全体を覆って操作不能にする）"""
+
+        # 既にオーバーレイが表示されている場合はテキストを更新
+        if (
+            hasattr(self, "loading_overlay")
+            and self.loading_overlay in self.page.overlay
+        ):
+            # オーバーレイ内のテキストコントロールを探して更新
+            if isinstance(self.loading_overlay, ft.Container) and isinstance(
+                self.loading_overlay.content, ft.Column
+            ):
+                controls = self.loading_overlay.content.controls
+                if len(controls) >= 3 and isinstance(controls[2], ft.Text):
+                    controls[2].value = message
+                    self.page.update()
+                    return
 
         # オーバーレイ用のコンテナ作成
         overlay = ft.Container(
@@ -310,8 +335,81 @@ class ConversationWindow:
                         self.page.overlay.remove(overlay)
             self.page.update()
 
+    def _load_session_data(self) -> None:
+        """指定されたセッションディレクトリからデータを復元"""
+        if not self.current_session_dir:
+            return
+
+        print(f"セッションデータを復元中: {self.current_session_dir}")
+
+        # 1. リスニングデータの復元
+        listening_path = self.current_session_dir / "listening.json"
+        if listening_path.exists():
+            try:
+                with open(listening_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.listening_score = data.get("score", 0)
+                    self.listening_question_count = data.get("total_questions", 0)
+                    self.listening_results = data.get("results", [])
+                    self.listening_test_completed = True
+                    print("リスニングデータを復元しました")
+            except Exception as e:
+                print(f"リスニングデータ復元エラー: {e}")
+
+        # 2. 会話データの復元
+        conversation_path = self.current_session_dir / "conversation.json"
+        if conversation_path.exists():
+            try:
+                with open(conversation_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    # 履歴を復元
+                    if "conversation_history" in data:
+                        self.conversation_history = data["conversation_history"]
+                    elif (
+                        "conversation_transcript" in data
+                        and data["conversation_transcript"]
+                    ):
+                        # 互換性: 履歴がないがテキストがある場合、完了したとみなすためのダミーデータをセット
+                        self.conversation_history = [
+                            {"role": "system", "text": "Restored session"}
+                        ]
+
+                    # 評価結果もあれば復元してグラフに反映
+                    eval_data = data.get("evaluation", {})
+                    if eval_data:
+                        score_entry = {
+                            "grammar": eval_data.get("grammar_score", 0),
+                            "vocabulary": eval_data.get("vocabulary_score", 0),
+                            "naturalness": eval_data.get("naturalness_score", 0),
+                            "fluency": eval_data.get("fluency_score", 0),
+                            "overall": eval_data.get("overall_score", 0),
+                        }
+                        self.evaluation_scores_history.append(score_entry)
+
+                    print("会話データを復元しました")
+            except Exception as e:
+                print(f"会話データ復元エラー: {e}")
+
+        # 3. 文法データの復元
+        grammar_path = self.current_session_dir / "grammar.json"
+        if grammar_path.exists():
+            try:
+                with open(grammar_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.grammar_score = data.get("score", 0)
+                    self.grammar_question_count = data.get("total_questions", 0)
+                    self.grammar_results = data.get("results", [])
+                    self.grammar_test_completed = True
+                    print("文法データを復元しました")
+            except Exception as e:
+                print(f"文法データ復元エラー: {e}")
+
     def build(self) -> None:
         """ウィジェットの構築"""
+        # セッションデータの復元
+        if self.current_session_dir and self.current_session_dir.exists():
+            self._load_session_data()
+
         # テスト状態の確認
         has_progress = self.storage_service.has_test_progress()
         self.test_initialized = not has_progress
@@ -1166,6 +1264,9 @@ class ConversationWindow:
             color=ft.colors.WHITE,
         )
 
+        # 過去の履歴セクション
+        history_section = self._create_history_section()
+
         # APIチェックセクション
         api_section = self._create_api_section()
 
@@ -1185,17 +1286,26 @@ class ConversationWindow:
                     ft.Container(height=20),
                     ft.Row([reset_button], alignment=ft.MainAxisAlignment.CENTER),
                     ft.Container(height=20),
-                    # LLM APIチェックとファイル保存場所を横並びに配置
                     ft.Row(
                         [
-                            api_section,
-                            save_location_section,
+                            history_section,
+                            ft.Column(
+                                [
+                                    ft.Row(
+                                        [api_section, save_location_section],
+                                        alignment=ft.MainAxisAlignment.CENTER,
+                                        spacing=20,
+                                    ),
+                                    ft.Container(height=20),
+                                    audio_section,
+                                ],
+                                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
                         ],
                         alignment=ft.MainAxisAlignment.CENTER,
-                        spacing=20,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                        spacing=40,
                     ),
-                    ft.Container(height=20),
-                    audio_section,
                     ft.Container(height=20),
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1207,6 +1317,119 @@ class ConversationWindow:
         )
 
         return content
+
+    def _create_history_section(self) -> ft.Container:
+        """過去のテスト履歴セクションの作成"""
+        # 履歴リストを作成
+        self.history_list = ft.ListView(
+            expand=True,
+            spacing=10,
+            padding=10,
+        )
+
+        # 履歴リストを更新
+        self._refresh_history_list()
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "過去のテスト履歴",
+                        size=20,
+                        weight=ft.FontWeight.BOLD,
+                        text_align=ft.TextAlign.CENTER,
+                        color=ft.colors.BLACK,
+                    ),
+                    ft.Container(height=10),
+                    ft.Container(
+                        content=self.history_list,
+                        height=400,  # 高さを制限
+                        border=ft.border.all(1, ft.colors.GREY_400),
+                        border_radius=5,
+                        padding=5,
+                        bgcolor=ft.colors.GREY_50,
+                    ),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=20,
+            border=ft.border.all(1, ft.colors.GREY_400),
+            border_radius=10,
+            width=400,
+        )
+
+    def _refresh_history_list(self) -> None:
+        """履歴リストを更新"""
+        if not self.history_list:
+            return
+
+        self.history_list.controls.clear()
+        base_dir = self.save_directory
+
+        if base_dir.exists():
+            records = sorted(list(base_dir.glob("TestRecord_*")), reverse=True)
+
+            if records:
+                for record_path in records:
+                    folder_name = record_path.name
+                    # 日付をパース
+                    try:
+                        parts = folder_name.split("_")
+                        if len(parts) >= 2:
+                            date_str = parts[1]
+                            formatted_date = (
+                                f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
+                            )
+
+                            # データチェック
+                            has_conv = (record_path / "conversation.json").exists()
+                            has_list = (record_path / "listening.json").exists()
+                            has_gram = (record_path / "grammar.json").exists()
+
+                            tags = []
+                            if has_conv:
+                                tags.append("会話")
+                            if has_list:
+                                tags.append("リスニング")
+                            if has_gram:
+                                tags.append("文法")
+
+                            subtitle = f"{', '.join(tags)} ({parts[2] if len(parts) > 2 else ''})"
+                        else:
+                            formatted_date = folder_name
+                            subtitle = ""
+                    except:
+                        formatted_date = folder_name
+                        subtitle = ""
+
+                    self.history_list.controls.append(
+                        ft.Container(
+                            content=ft.ListTile(
+                                leading=ft.Icon(ft.icons.HISTORY, color=ft.colors.BLUE),
+                                title=ft.Text(
+                                    formatted_date, weight=ft.FontWeight.BOLD
+                                ),
+                                subtitle=ft.Text(
+                                    subtitle, size=12, color=ft.colors.GREY_700
+                                ),
+                                on_click=lambda e,
+                                path=record_path: self._on_history_item_clicked(path),
+                            ),
+                            bgcolor=ft.colors.WHITE,
+                            border=ft.border.all(1, ft.colors.GREY_300),
+                            border_radius=5,
+                        )
+                    )
+            else:
+                self.history_list.controls.append(
+                    ft.Text("履歴が見つかりませんでした", color=ft.colors.GREY)
+                )
+        else:
+            self.history_list.controls.append(
+                ft.Text("保存ディレクトリが見つかりません", color=ft.colors.RED)
+            )
+
+        self.page.update()
 
     def _create_save_location_section(self) -> ft.Container:
         """保存場所選択セクションの作成"""
@@ -1277,7 +1500,10 @@ class ConversationWindow:
                         self.save_directory_text.value = (
                             f"保存場所: {str(self.save_directory)}"
                         )
-                        self.page.update()
+
+                    # 履歴リストを更新
+                    self._refresh_history_list()
+                    self.page.update()
                 else:
                     print(f"選択されたパスはディレクトリではありません: {e.path}")
             except Exception as ex:
@@ -1285,6 +1511,106 @@ class ConversationWindow:
         else:
             # キャンセルされた場合は何もしない
             pass
+
+    def _on_history_item_clicked(self, record_path: Path) -> None:
+        """履歴アイテムクリック時の処理"""
+        # ダイアログを閉じる
+        if self.page.dialog:
+            self.page.close(self.page.dialog)
+
+        print(f"履歴読み込み: {record_path}")
+
+        # リソースのクリーンアップ（音声監視を停止）
+        # これを行わないと、ResultWindow表示中も裏でマイク監視が続き、
+        # さらに戻った後に新しいウィンドウでも監視が始まって競合する可能性がある
+        try:
+            if self.audio_service:
+                self.audio_service.stop_mic_monitoring()
+                self.audio_service.stop_speaker_monitoring()
+                print("音声監視を停止しました（履歴画面遷移前）")
+        except Exception as e:
+            print(f"履歴遷移前のクリーンアップエラー: {e}")
+
+        # データを読み込んで統合
+        result_data = {}
+
+        # 1. 会話データ
+        conv_path = record_path / "conversation.json"
+        if conv_path.exists():
+            try:
+                with open(conv_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    eval_data = data.get("evaluation", {})
+                    if eval_data:
+                        result_data.update(eval_data)
+            except Exception as e:
+                print(f"会話履歴読み込みエラー: {e}")
+
+        # 2. リスニングデータ
+        list_path = record_path / "listening.json"
+        if list_path.exists():
+            try:
+                with open(list_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    result_data["listening_score"] = data.get("score", 0)
+                    result_data["listening_question_count"] = data.get(
+                        "total_questions", 0
+                    )
+                    result_data["listening_results"] = data.get("results", [])
+                    # パッセージデータを取得
+                    passages = data.get("passages", [])
+                    if passages:
+                        result_data["listening_passages"] = passages
+                    else:
+                        # 互換性: passagesがない場合はダミーを作成
+                        passages_dummy = []
+                        # passage_index の最大値を探す
+                        max_idx = -1
+                        for res in data.get("results", []):
+                            p_idx = res.get("passage_index", 0)
+                            if p_idx > max_idx:
+                                max_idx = p_idx
+
+                        for i in range(max_idx + 1):
+                            passages_dummy.append({"passage": "(スクリプトデータなし)"})
+
+                        result_data["listening_passages"] = passages_dummy
+
+            except Exception as e:
+                print(f"リスニング履歴読み込みエラー: {e}")
+
+        # 3. 文法データ（もしResultWindowで表示するなら）
+        # 現状ResultWindowは文法タブを持っていませんが、将来的に追加するならここで読み込む
+
+        if not result_data:
+            print("有効なデータが見つかりませんでした")
+            return
+
+        # 画面遷移用のコールバック（メイン画面に戻る）
+        def on_back():
+            try:
+                # 現在のConversationWindowを再構築してメイン画面に戻る
+                self.page.clean()
+
+                # 少し待機してリソース解放を確実にする
+                time.sleep(0.1)
+
+                new_window = ConversationWindow(self.page, save_dir=self.save_directory)
+                new_window.build()
+                self.page.update()
+            except Exception as e:
+                print(f"メイン画面への復帰エラー: {e}")
+                # エラーが発生した場合でも、最低限のUIを表示するか、リトライを促す
+                self.page.add(
+                    ft.Text(
+                        f"画面の復帰中にエラーが発生しました: {e}", color=ft.colors.RED
+                    )
+                )
+                self.page.update()
+
+        # 結果画面へ遷移
+        result_window = ResultWindow(self.page, result_data, on_back)
+        result_window.build()
 
     def _create_api_section(self) -> ft.Container:
         """APIチェックセクションの作成"""
@@ -2683,36 +3009,9 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                     self.realtime_service = None
                     self.audio_service.stop_mic_monitoring()
 
-                # 会話履歴がなくても評価フローに進む（空の場合は0点として処理される）
+            # 会話履歴がなくても評価フローに進む（空の場合は0点として処理される）
+            if test_id == "conversation":
                 self._evaluate_conversation_async(is_final=True)
-
-            # リスニングテスト終了時も、会話が終わっていれば結果画面へ遷移したい
-            if test_id == "listening":
-                # ステータステキストを非表示にする
-                if "listening" in self.tab_status_texts:
-                    status_text = self.tab_status_texts["listening"]
-                    status_text.value = ""
-                    status_text.visible = False
-                    self.page.update()
-
-                if len(self.conversation_history) > 0 and not self.conversation_running:
-                    # 会話テストが既に終了している場合、再評価を行って結果画面を表示
-                    # 会話の評価は保存されているはずだが、TOEIC予測のために再実行（あるいは保存された結果を使用）
-                    # 簡便のため、会話評価を再実行して結果画面へ遷移させる
-                    self._evaluate_conversation_async(is_final=True)
-
-            # 文法テスト終了時も、会話が終わっていれば結果画面へ遷移したい
-            if test_id == "grammar":
-                # ステータステキストを非表示にする
-                if "grammar" in self.tab_status_texts:
-                    status_text = self.tab_status_texts["grammar"]
-                    status_text.value = ""
-                    status_text.visible = False
-                    self.page.update()
-
-                if len(self.conversation_history) > 0 and not self.conversation_running:
-                    # 会話テストが既に終了している場合、再評価を行って結果画面を表示
-                    self._evaluate_conversation_async(is_final=True)
 
             # テスト実行中フラグを解除
             self.test_running = False
@@ -2852,6 +3151,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                 if self.audio_service:
                     self.audio_service.stop_mic_monitoring()
                     self.audio_service.stop_speaker_monitoring()
+                    print("音声監視を停止しました（結果画面からの戻り）")
 
                 # タイマー停止
                 self.overall_timer_running = False
@@ -2862,16 +3162,31 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                 print(f"Cleanup error during transition: {e}")
 
             # セッションディレクトリをリセットして次のセッションの準備
-            self.current_session_dir = None
+            # ただし、同じセッションを継続したい場合はリセットしない方が良いかもしれないが
+            # ここでは「戻る」=「テスト選択画面に戻る」なので、同じセッションID（ディレクトリ）を引き継ぐ
+            current_dir = self.current_session_dir
 
             self.page.clean()
 
-            # 新しいConversationWindowインスタンスを作成して再構築
-            # これにより、すべての状態（スコア、履歴など）が初期化される
-            new_window = ConversationWindow(self.page)
-            new_window.build()
+            # 少し待機してリソース解放を確実にする
+            time.sleep(0.1)
 
-            self.page.update()
+            try:
+                # 新しいConversationWindowインスタンスを作成して再構築
+                # session_dirを渡して状態を復元させる
+                new_window = ConversationWindow(
+                    self.page, session_dir=current_dir, save_dir=self.save_directory
+                )
+                new_window.build()
+                self.page.update()
+            except Exception as e:
+                print(f"画面復帰エラー: {e}")
+                self.page.add(
+                    ft.Text(
+                        f"画面の復帰中にエラーが発生しました: {e}", color=ft.colors.RED
+                    )
+                )
+                self.page.update()
 
         # 結果画面を表示
         result_window = ResultWindow(self.page, result_data, on_back)
@@ -2909,7 +3224,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                             "naturalness_score": 0,
                             "fluency_score": 0,
                             "overall_score": 0,
-                            "predicted_toeic_score": None,
+                            "predicted_total_score": None,
                             "feedback": "会話履歴がありませんでした。マイクの接続を確認するか、もっと長く話してみてください。",
                         }
                         # print("結果画面へ遷移します（空の履歴）")
@@ -2962,10 +3277,10 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                             # 評価中のオーバーレイを表示
                             # メインスレッドで実行する必要があるため、少しハッキーだが非同期関数内から同期的に呼び出す
                             # UI更新はメインスレッドで行われる
-                            self._show_evaluating_overlay("TOEICスコアを判定中...")
+                            self._show_evaluating_overlay("総合スコアを判定中...")
 
                             try:
-                                # TOEIC予測スコアの計算 (GPT-5による予測)
+                                # TOEICスコア予測の計算 (GPT-5による予測)
                                 # print("TOEICスコア予測を実行中...")
                                 # タイムアウト設定を追加（60秒）
                                 predicted_result = await asyncio.wait_for(
@@ -2976,7 +3291,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                                     ),
                                     timeout=60.0,
                                 )
-                                predicted_toeic_score = predicted_result.get(
+                                predicted_total_score = predicted_result.get(
                                     "predicted_score", 0
                                 )
 
@@ -2984,18 +3299,18 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                                 reasoning = predicted_result.get("reasoning", "")
                                 if reasoning:
                                     feedback += (
-                                        f"\n\n### TOEICスコア予測の根拠\n{reasoning}"
+                                        f"\n\n### 総合スコア予測の根拠\n{reasoning}"
                                     )
                             except asyncio.TimeoutError:
-                                print("TOEICスコア予測がタイムアウトしました")
+                                print("総合スコア予測がタイムアウトしました")
                                 feedback += (
-                                    "\n\n※TOEICスコア予測の処理がタイムアウトしました。"
+                                    "\n\n※総合スコア予測の処理がタイムアウトしました。"
                                 )
-                                predicted_toeic_score = 0
+                                predicted_total_score = 0
                             except Exception as e:
-                                print(f"TOEICスコア予測エラー: {str(e)}")
-                                feedback += f"\n\n※TOEICスコア予測中にエラーが発生しました: {str(e)}"
-                                predicted_toeic_score = 0
+                                print(f"総合スコア予測エラー: {str(e)}")
+                                feedback += f"\n\n※総合スコア予測中にエラーが発生しました: {str(e)}"
+                                predicted_total_score = 0
                             finally:
                                 # 必ずオーバーレイを消す
                                 self._hide_evaluating_overlay()
@@ -3006,10 +3321,10 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                                 "naturalness_score": naturalness_score,
                                 "fluency_score": fluency_score,
                                 "overall_score": overall_score,
-                                "predicted_toeic_score": predicted_toeic_score,
+                                "predicted_total_score": predicted_total_score,
                                 "feedback": feedback,
                             }
-                            # print("結果画面へ遷移します（TOEIC予測あり）")
+                            # print("結果画面へ遷移します（総合スコアあり）")
                             self._transition_to_result_screen(result_data)
 
                             # データを非同期で保存（UIをブロックしない）
@@ -3021,7 +3336,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                                 fluency_score,
                                 overall_score,
                                 feedback,
-                                predicted_toeic_score,
+                                predicted_total_score,
                             )
                         else:
                             # 片方のテストしか終わっていない場合でも結果画面へ遷移
@@ -3034,7 +3349,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                                 fluency_score,
                                 overall_score,
                                 feedback,
-                                None,  # まだTOEIC予測はしない
+                                None,  # まだ総合スコア計算はしない
                             )
 
                             # 結果画面へ遷移
@@ -3044,9 +3359,9 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                                 "naturalness_score": naturalness_score,
                                 "fluency_score": fluency_score,
                                 "overall_score": overall_score,
-                                "predicted_toeic_score": None,
+                                "predicted_total_score": None,
                                 "feedback": feedback
-                                + "\n\n※リスニングまたは文法テストが未完了のため、TOEICスコア予測は表示されません。",
+                                + "\n\n※リスニングまたは文法テストが未完了のため、総合スコアは表示されません。",
                             }
                             # print("結果画面へ遷移します（会話のみ）")
                             self._transition_to_result_screen(result_data)
@@ -3307,7 +3622,7 @@ Please respond in JSON format:
         fluency_score: float,
         overall_score: float,
         feedback: str,
-        predicted_toeic_score: int | None = None,
+        predicted_total_score: int | None = None,
     ) -> None:
         """会話データを非同期で保存（書き起こし、mp3、評価スコアと講評）
 
@@ -3334,13 +3649,14 @@ Please respond in JSON format:
             # JSONデータを作成
             json_data = {
                 "conversation_transcript": conversation_text,
+                "conversation_history": self.conversation_history,  # 生の履歴データを保存（復元用）
                 "evaluation": {
                     "grammar_score": grammar_score,
                     "vocabulary_score": vocabulary_score,
                     "naturalness_score": naturalness_score,
                     "fluency_score": fluency_score,
                     "overall_score": overall_score,
-                    "predicted_toeic_score": predicted_toeic_score,
+                    "predicted_total_score": predicted_total_score,
                     "feedback": feedback,
                 },
                 "timestamp": datetime.now().isoformat(),
@@ -3824,6 +4140,7 @@ Please respond in JSON format:
             # 結果を保存
             self.listening_results.append(
                 {
+                    "passage_index": self.current_listening_index,
                     "question": problem["question"],
                     "options": problem["options"],
                     "correct_answer": correct_ans,
@@ -3931,6 +4248,7 @@ Please respond in JSON format:
                 if self.listening_question_count > 0
                 else 0,
                 "results": self.listening_results,
+                "passages": self.listening_problems,  # 問題文データも保存
                 "timestamp": datetime.now().isoformat(),
             }
 
@@ -3954,20 +4272,21 @@ Please respond in JSON format:
         # タイマーを停止
         self._stop_test_timer("listening")
 
-        # メイン画面へ戻る
-        if self.tabs:
-            self.tabs.selected_index = 0
-            # タブ変更イベントを手動でトリガー
-            self._on_tab_changed(
-                ft.ControlEvent(
-                    target="tabs",
-                    name="change",
-                    data="0",
-                    control=self.tabs,
-                    page=self.page,
-                )
-            )
-            self.page.update()
+        # すべてのテストが完了しているかチェック（会話、リスニング、文法）
+        if self._check_all_tests_completed():
+            # 総合評価（TOEIC予測）を実行して結果画面へ遷移
+            self._evaluate_conversation_async(is_final=True)
+        else:
+            # リスニングテストの結果データを構築
+            result_data = {
+                "listening_score": self.listening_score,
+                "listening_question_count": self.listening_question_count,
+                "listening_results": self.listening_results,
+                "listening_passages": self.listening_problems,  # 問題文データも渡す
+            }
+
+            # 結果画面へ遷移
+            self._transition_to_result_screen(result_data)
 
     def _create_grammar_test_content(self) -> ft.Container:
         """文法テストタブのコンテンツを作成"""
@@ -4343,16 +4662,20 @@ Please respond in JSON format:
         self.grammar_test_completed = True
         self._stop_test_timer("grammar")
 
-        # メイン画面へ戻る
-        if self.tabs:
-            self.tabs.selected_index = 0
-            self._on_tab_changed(
-                ft.ControlEvent(
-                    target="tabs",
-                    name="change",
-                    data="0",
-                    control=self.tabs,
-                    page=self.page,
+        # すべてのテストが完了しているかチェック
+        if self._check_all_tests_completed():
+            self._evaluate_conversation_async(is_final=True)
+        else:
+            # メイン画面へ戻る
+            if self.tabs:
+                self.tabs.selected_index = 0
+                self._on_tab_changed(
+                    ft.ControlEvent(
+                        target="tabs",
+                        name="change",
+                        data="0",
+                        control=self.tabs,
+                        page=self.page,
+                    )
                 )
-            )
-            self.page.update()
+                self.page.update()

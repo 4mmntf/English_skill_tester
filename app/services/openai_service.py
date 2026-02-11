@@ -270,7 +270,7 @@ class OpenAIService:
             print(f"音声生成エラー: {e}")
             return False
 
-    async def predict_toeic_score(
+    async def predict_total_score(
         self,
         conversation_text: str,
         listening_results: list[Dict[str, Any]],

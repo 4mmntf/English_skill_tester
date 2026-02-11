@@ -69,7 +69,7 @@ class EvaluationService:
             timestamp=datetime.now(),
         )
 
-    async def predict_toeic_score(
+    async def predict_total_score(
         self,
         conversation_text: str,
         listening_results: list[Dict[str, Any]],
@@ -86,6 +86,6 @@ class EvaluationService:
         Returns:
             予測スコア情報
         """
-        return await self.openai_service.predict_toeic_score(
+        return await self.openai_service.predict_total_score(
             conversation_text, listening_results, grammar_results
         )
