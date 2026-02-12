@@ -3,6 +3,7 @@
 """
 
 import flet as ft
+import sys
 import time
 import threading
 import random
@@ -3938,7 +3939,19 @@ Please respond in JSON format:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-            speech_file = Path(__file__).parent.parent.parent / "temp_speech.mp3"
+            if getattr(sys, "frozen", False):
+                # PyInstaller環境では_internalフォルダを使用（ユーザーの指示に従う）
+                # EXEと同じ階層にある_internalフォルダを探す
+                internal_dir = Path(sys.executable).parent / "_internal"
+                if internal_dir.exists():
+                    speech_file = internal_dir / "temp_speech.mp3"
+                else:
+                    speech_file = Path(sys.executable).parent / "temp_speech.mp3"
+            else:
+                speech_file = Path(__file__).parent.parent.parent / "temp_speech.mp3"
+
+            print(f"Creating speech file at: {speech_file}")
+
             success = loop.run_until_complete(
                 self.evaluation_service.openai_service.generate_speech(
                     passage_text, str(speech_file)

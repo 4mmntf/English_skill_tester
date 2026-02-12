@@ -23,7 +23,14 @@ if getattr(sys, 'frozen', False):
     
     # Fletクライアントの正しいパスを設定 (onedirモード)
     # PyInstallerはfletファイルを _internal/flet に配置する
-    flet_path = application_path / '_internal' / 'flet'
+    internal_path = application_path / '_internal'
+    
+    # _internalフォルダをPATHに追加（ffmpegなどがここにある場合に対応）
+    if internal_path.exists():
+        os.environ["PATH"] += os.pathsep + str(internal_path)
+        print(f"Added to PATH: {internal_path}")
+
+    flet_path = internal_path / 'flet'
     if flet_path.exists():
         # get_package_bin_dir()が正しいパスを返すようにモンキーパッチ
         import flet_desktop
