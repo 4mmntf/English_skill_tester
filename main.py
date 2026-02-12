@@ -4,6 +4,7 @@ macOS開発環境、Windows配布
 """
 import sys
 import os
+import base64
 import flet as ft
 from pathlib import Path
 from app.gui.home_window import HomeWindow
@@ -42,7 +43,7 @@ else:
     load_dotenv()
 
 # APIキーが環境変数に設定されていない場合、埋め込みキーを使用（配布用）
-# 注意: PyInstallerの--keyオプションでバイトコードを暗号化することを推奨
+# Base64エンコードして簡易的な難読化を行う（平文でgrepされるのを防ぐため）
 
 
 
