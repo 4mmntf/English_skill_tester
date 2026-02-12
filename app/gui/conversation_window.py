@@ -77,11 +77,11 @@ class ConversationWindow:
                 "name": "リスニングテスト",
                 "description": "聞き取り能力を評価します",
             },
-            {
-                "id": "grammar",
-                "name": "文法テスト",
-                "description": "文法の正確性を評価します",
-            },
+            # {
+            #     "id": "grammar",
+            #     "name": "文法テスト",
+            #     "description": "文法の正確性を評価します",
+            # },
         ]
 
         # 録音状態（メイン画面用）
@@ -2895,7 +2895,8 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
         listening_done = self.listening_test_completed
 
         # 文法テストが完了しているか
-        grammar_done = self.grammar_test_completed
+        # grammar_done = self.grammar_test_completed
+        grammar_done = True # 文法テストは一時的に無効化
 
         return conversation_done and listening_done and grammar_done
 
