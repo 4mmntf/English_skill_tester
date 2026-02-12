@@ -27,7 +27,6 @@ a = Analysis(
     excludes=['flet_cli.__pyinstaller'],
     runtime_hooks=[],
     win_no_prefer_redirects=False,
-    win_private_assemblies=True,
     cipher=block_cipher,
     noarchive=False,
 )
