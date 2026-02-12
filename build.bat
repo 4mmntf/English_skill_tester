@@ -15,10 +15,13 @@ if %ERRORLEVEL% NEQ 0 (
 REM 依存パッケージのインストール
 echo Installing dependencies...
 uv sync
+echo Installing tinyaes for encryption...
+uv pip install tinyaes
 
 REM PyInstallerでビルド
 echo Building executable...
-uv run pyinstaller build_windows.spec
+REM --keyオプションでバイトコードを暗号化（簡易的な保護）
+uv run pyinstaller --key=EnglishSkillKey1 build_windows.spec
 
 echo Build complete! Executable is in dist\EnglishSkillApp.exe
 

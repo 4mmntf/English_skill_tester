@@ -64,14 +64,29 @@ class OpenAIService:
         1. ユーザー（学生）の発言が上記のフレーズ**のみ**の場合、または実質的な意味のある発言がほぼ皆無（2ターン未満の有意義な会話）の場合は、**全てのスコアを 0 に設定し、is_valid を false にしてください**。
         2. ユーザーが "Yes", "No", "Hello" などの単語しか発していない場合、スコアは **30点以下** に抑えてください。
         3. 70点以上の高得点は、完全な文章で話し、複数回の往復（キャッチボール）が成立している場合のみ与えてください。
+        4. 会話が成立していない、またはハルシネーションが多い場合は、全体スコアを大幅に減点してください。
+        5. お世辞のような評価は避け、厳格に評価してください。
+
+        【評価基準の追加・変更】
+        以下の要素を厳密に評価スコアに反映させてください：
+
+        **加点対象 (+):**
+        - **フィラーの適切な使用:** 次に話す内容のトーンを予告するようなフィラー（例: "Well...", "Actually...", "You know..."）を使用している場合。
+        - **具体的な語彙:** 文脈に合った、あいまいでない具体的な単語を使用している場合。
+        - **言い換え（Circumlocution）:** 単語を忘れた際などに、会話を止めずに別の言葉で説明して繋いでいる場合。
+
+        **減点対象 (-):**
+        - **長い沈黙・無音:** 会話のリズムが悪い場合。
+        - **母国語の癖:** "Uh..." (日本語的な発音), "Eeto...", "Ano..." など、母国語（日本語）のフィラーが出てしまっている場合。
+        - **短文の連続:** 一文が極端に短い発言が続き、会話が深まらない場合。
 
         【評価観点】
         実質的な会話が行われている場合のみ、以下を評価してください：
-        1. 会話として成立しているか（お互いの意図が伝わっているか）
-        2. 文法の正確性
-        3. 語彙の適切性
-        4. 会話の自然さ
-        5. 会話の流暢さ
+        1. 会話レベル (1-10段階): ユーザーの英語レベルを10段階で評価
+        2. 文法の正確性 (0-100)
+        3. 語彙の適切性 (0-100)
+        4. 会話の自然さ (0-100)
+        5. 会話の流暢さ (0-100)
         
         また、会話中に出てくる学習者にとって難しいと思われる単語や、重要な単語があれば抽出して解説してください。
         
@@ -81,12 +96,13 @@ class OpenAIService:
         評価結果を以下のJSON形式で返してください：
         {{
             "is_valid": true/false,  // 会話として成立しているか（ハルシネーションのみの場合はfalse）
+            "conversation_level": 1-10, // 会話レベル（1:初学者 - 10:ネイティブ級）
             "grammar_score": 0-100,  // 文法の正確性スコア
             "vocabulary_score": 0-100,  // 語彙の適切性スコア
             "naturalness_score": 0-100,  // 会話の自然さスコア
             "fluency_score": 0-100,  // 会話の流暢さスコア
             "overall_score": 0-100,  // 総合スコア（ハルシネーションのみなら0）
-            "feedback": "評価コメント（無音の場合はその旨を記載）",
+            "feedback": "評価コメント（無音の場合はその旨を記載）。レベル評価の理由も含めて記述してください。",
             "vocabulary_info": [
                 {{
                     "word": "単語",
@@ -115,8 +131,16 @@ class OpenAIService:
 
                 try:
                     evaluation_data = json.loads(content)
+
+                    # レベル情報をフィードバックに追加（既存のスキーマを変更しないため）
+                    level = evaluation_data.get("conversation_level", 0)
+                    original_feedback = evaluation_data.get("feedback", "")
+                    enhanced_feedback = (
+                        f"**推定会話レベル: {level}/10**\n\n{original_feedback}"
+                    )
+
                     return {
-                        "evaluation": evaluation_data.get("feedback", ""),
+                        "evaluation": enhanced_feedback,
                         "is_valid": evaluation_data.get("is_valid", False),
                         "grammar_score": evaluation_data.get("grammar_score", 0),
                         "vocabulary_score": evaluation_data.get("vocabulary_score", 0),

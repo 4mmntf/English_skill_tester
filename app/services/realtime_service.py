@@ -107,9 +107,9 @@ class RealtimeService:
                         "input_audio_transcription": {"model": "whisper-1"},
                         "turn_detection": {
                             "type": "server_vad",  # サーバー側のVADを使用
-                            "threshold": 0.5,  # 0.0-1.0の範囲。0.5は標準的。高すぎると小声が拾えないため、クライアント側のRMSフィルタとシステムプロンプトで制御する
+                            "threshold": 0.6,  # 0.5->0.6に変更。ノイズによる誤検知（AI発話の自己割り込み）を防ぐ
                             "prefix_padding_ms": 300,  # 発話開始前に含めるパディング
-                            "silence_duration_ms": 1000,  # 1000ms（1秒）無音が続いたら発話終了と判断（雑音での割り込み防止）
+                            "silence_duration_ms": 1200,  # 1000ms->1200msに変更。ユーザーの思考時間を少し確保
                         },
                         "temperature": 0.7,
                         "max_response_output_tokens": 1000,  # 音声が途切れないよう増やす

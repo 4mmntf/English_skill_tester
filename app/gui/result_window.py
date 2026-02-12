@@ -4,6 +4,8 @@
 
 import flet as ft
 from typing import Callable, Any
+import json
+from datetime import datetime
 
 
 class ResultWindow:
@@ -35,6 +37,61 @@ class ResultWindow:
         self.result_data = result_data
         self.on_back_callback = on_back_callback
 
+    def _extract_level(self, feedback: str) -> int | None:
+        """フィードバックテキストから会話レベルを抽出"""
+        try:
+            # "**推定会話レベル: X/10**" の形式を探す
+            import re
+
+            match = re.search(r"推定会話レベル:\s*(\d+)/10", feedback)
+            if match:
+                return int(match.group(1))
+            return None
+        except Exception:
+            return None
+
+    def _on_copy_research_data_clicked(self, e: ft.ControlEvent) -> None:
+        """研究用データをクリップボードにコピー"""
+        try:
+            # データの抽出と整形
+            data = {
+                "timestamp": datetime.now().isoformat(),
+                "predicted_total": self.result_data.get("predicted_total_score"),
+                "listening_score": self.result_data.get("listening_score"),
+                "reading_score": self.result_data.get("reading_score"),  # TOEIC予測から
+                "conversation_level": self._extract_level(
+                    self.result_data.get("feedback", "")
+                ),
+                "grammar": self.result_data.get("grammar_score"),
+                "vocabulary": self.result_data.get("vocabulary_score"),
+                "naturalness": self.result_data.get("naturalness_score"),
+                "fluency": self.result_data.get("fluency_score"),
+                "overall": self.result_data.get("overall_score"),
+            }
+
+            # JSON文字列に変換
+            json_str = json.dumps(data, ensure_ascii=False)
+
+            # クリップボードにコピー
+            self.page.set_clipboard(json_str)
+
+            # 通知を表示
+            self.page.snack_bar = ft.SnackBar(
+                content=ft.Text("研究用データをクリップボードにコピーしました"),
+                bgcolor=ft.colors.GREEN_700,
+            )
+            self.page.snack_bar.open = True
+            self.page.update()
+
+        except Exception as ex:
+            print(f"データコピーエラー: {ex}")
+            self.page.snack_bar = ft.SnackBar(
+                content=ft.Text("データのコピーに失敗しました"),
+                bgcolor=ft.colors.RED_700,
+            )
+            self.page.snack_bar.open = True
+            self.page.update()
+
     def build(self) -> None:
         """ウィジェットの構築"""
         self.page.clean()
@@ -50,6 +107,18 @@ class ResultWindow:
             self._build_listening_result()
         else:
             self._build_conversation_result()
+
+    def _create_copy_data_button(self) -> ft.ElevatedButton:
+        """研究用データコピーボタンを作成"""
+        return ft.ElevatedButton(
+            "研究用データをコピー",
+            icon=ft.icons.COPY,
+            on_click=self._on_copy_research_data_clicked,
+            width=200,
+            height=50,
+            bgcolor=ft.colors.GREY_700,
+            color=ft.colors.WHITE,
+        )
 
     def _build_combined_result(self) -> None:
         """総合結果画面（タブ表示）の構築"""
@@ -102,7 +171,14 @@ class ResultWindow:
                     ft.Container(height=20),
                     tabs,
                     ft.Container(height=20),
-                    back_button,
+                    ft.Row(
+                        [
+                            back_button,
+                            ft.Container(width=20),
+                            self._create_copy_data_button(),
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
                     ft.Container(height=20),
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -244,7 +320,14 @@ class ResultWindow:
                     ft.Container(height=30),
                     feedback_section,
                     ft.Container(height=30),
-                    back_button,
+                    ft.Row(
+                        [
+                            back_button,
+                            ft.Container(width=20),
+                            self._create_copy_data_button(),
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
                     ft.Container(height=20),
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -323,7 +406,14 @@ class ResultWindow:
                     ft.Container(height=10),
                     review_section,
                     ft.Container(height=30),
-                    back_button,
+                    ft.Row(
+                        [
+                            back_button,
+                            ft.Container(width=20),
+                            self._create_copy_data_button(),
+                        ],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
                     ft.Container(height=20),
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -470,7 +560,7 @@ class ResultWindow:
             ("語彙", self.result_data.get("vocabulary_score", 0), ft.colors.GREEN),
             ("自然さ", self.result_data.get("naturalness_score", 0), ft.colors.PURPLE),
             ("流暢さ", self.result_data.get("fluency_score", 0), ft.colors.ORANGE),
-            ("総合", self.result_data.get("overall_score", 0), ft.colors.RED),
+            ("会話総合", self.result_data.get("overall_score", 0), ft.colors.RED),
         ]
 
         bar_groups = []
@@ -501,7 +591,7 @@ class ResultWindow:
                     ft.ChartAxisLabel(value=2, label=ft.Text("自然さ")),
                     ft.ChartAxisLabel(value=3, label=ft.Text("流暢さ")),
                     ft.ChartAxisLabel(
-                        value=4, label=ft.Text("総合", weight=ft.FontWeight.BOLD)
+                        value=4, label=ft.Text("会話総合", weight=ft.FontWeight.BOLD)
                     ),
                 ],
                 labels_size=40,
@@ -529,7 +619,7 @@ class ResultWindow:
     def _create_score_details(self) -> ft.Container:
         """スコア詳細表示を作成"""
         scores = [
-            ("総合スコア", self.result_data.get("overall_score", 0), ft.colors.RED),
+            ("会話総合スコア", self.result_data.get("overall_score", 0), ft.colors.RED),
             ("文法", self.result_data.get("grammar_score", 0), ft.colors.BLUE),
             ("語彙", self.result_data.get("vocabulary_score", 0), ft.colors.GREEN),
             ("自然さ", self.result_data.get("naturalness_score", 0), ft.colors.PURPLE),

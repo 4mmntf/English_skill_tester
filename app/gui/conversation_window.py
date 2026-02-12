@@ -252,10 +252,6 @@ class ConversationWindow:
         # 履歴リストコンポーネント
         self.history_list: ft.ListView | None = None
 
-        # 無音検知タイマー
-        self.silence_timer: threading.Timer | None = None
-        self.silence_timeout_seconds: float = 15.0  # 15秒間無音なら質問を変える
-
     def _show_evaluating_overlay(self, message: str) -> None:
         """評価中のオーバーレイを表示（画面全体を覆って操作不能にする）"""
 
@@ -2058,27 +2054,30 @@ You have access to two tools:
 
         # レベル適応に関する共通の指示
         adaptive_instructions = """
-**Adaptive Difficulty Instructions (CRITICAL):**
-You MUST adapt your English level, vocabulary, and response style to the user's proficiency.
-1.  **If the user struggles, speaks broken English, or doesn't understand:**
-    *   Speak slowly and clearly.
-    *   Use simple vocabulary and short sentences.
-    *   Ask simple Yes/No questions to help them continue (e.g., "Do you like ...?", "Is it ...?").
-    *   Be patient and encouraging.
-    *   If they seem stuck, kindly ask "Shall I repeat that?" or "Do you mean...?"
-2.  **If the user is fluent and confident:**
-    *   Speak at a natural, native speed.
-    *   Use more complex vocabulary, idioms, and natural expressions.
-    *   Ask open-ended questions to deepen the conversation.
-    *   Respond with more nuance.
-**Always monitor the user's understanding and adjust immediately.**
+        **Adaptive Difficulty Instructions (CRITICAL):**
+        You MUST constantly assess the user's English proficiency on a scale of 1-10 and adapt your behavior accordingly.
 
-**Noise Handling (CRITICAL):**
-If the user input is just noise, coughing, breathing, or very short unintelligible sounds, IGNORE it. 
-Do not say "I'm sorry?" or "I can't hear you" immediately for short noises. 
-Treat it as silence and wait for clear speech. 
-Only respond when you detect a clear, plausible intent or speech from the user.
-"""
+        1.  **Level Assessment & Adaptation:**
+            *   **Low Level (1-3):** Speak slowly, use simple vocabulary, short sentences, and yes/no questions. Be patient and encouraging.
+            *   **Mid Level (4-7):** Speak at a natural pace but clearly. Use standard vocabulary.
+            *   **High Level (8-10):** Speak at a native speed with complex vocabulary, idioms, and nuance.
+
+        2.  **Conversation Flow & Fillers (CRITICAL):**
+            *   **Use Tone-Signaling Fillers:** Use natural English fillers like "Well...", "Actually...", "You know...", "I see..." to signal the tone of your upcoming response.
+            *   **Avoid Japanese Fillers:** NEVER use Japanese-style fillers like "Eeto...", "Ano...", or "Uh..." (with Japanese phonetics).
+            *   **Avoid Long Silences:** Keep the conversation moving rhythmically.
+
+        3.  **Vocabulary & Support:**
+            *   **Specific Vocabulary:** Use context-appropriate, specific vocabulary (not vague words).
+            *   **Circumlocution Support:** If the user seems to forget a word or gets stuck, DO NOT stop the conversation. Instead, offer a helping word or paraphrase what they might mean (circumlocution) to keep the flow going.
+            *   **Encourage Output:** If the user gives very short answers, ask open-ended follow-up questions to encourage them to speak more.
+
+        **Noise Handling (CRITICAL):**
+        If the user input is just noise, coughing, breathing, or very short unintelligible sounds, IGNORE it. 
+        Do not say "I'm sorry?" or "I can't hear you" immediately for short noises. 
+        Treat it as silence and wait for clear speech. 
+        Only respond when you detect a clear, plausible intent or speech from the user.
+        """
 
         # シナリオごとのプロンプト設定
         system_prompt = ""
@@ -2258,49 +2257,6 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
         except Exception as e:
             print(f"AI音声処理エラー: {str(e)}")
 
-    def _start_silence_timer(self) -> None:
-        """無音検知タイマーを開始"""
-        # 既存のタイマーがあればキャンセル
-        self._stop_silence_timer()
-
-        if not self.conversation_running or self.test_paused:
-            return
-
-        def timeout_callback():
-            self._on_silence_timeout()
-
-        self.silence_timer = threading.Timer(
-            self.silence_timeout_seconds, timeout_callback
-        )
-        self.silence_timer.daemon = True
-        self.silence_timer.start()
-        print(f"無音検知タイマーを開始しました（{self.silence_timeout_seconds}秒）")
-
-    def _stop_silence_timer(self) -> None:
-        """無音検知タイマーを停止"""
-        if self.silence_timer:
-            self.silence_timer.cancel()
-            self.silence_timer = None
-            # print("無音検知タイマーを停止しました") # 頻繁に出るのでコメントアウト
-
-    def _on_silence_timeout(self) -> None:
-        """無音検知タイムアウト時の処理"""
-        if not self.conversation_running or self.test_paused:
-            return
-
-        print(
-            "無音タイムアウト：ユーザーの反応がありません。AIに質問の変更を依頼します。"
-        )
-
-        # AIに指示を送信（システムプロンプト的な指示として送信）
-        # ユーザーには見えないようにしたいが、send_textはユーザー発話として扱われる
-        # カッコ書きで状況を説明することで、AIに指示として認識させる
-        instruction = "(User has been silent for a while. Please ask a different, perhaps simpler question, or change the topic to encourage them to speak.)"
-
-        if self.realtime_service:
-            # 内部メッセージとして送信（GUIの会話履歴には表示しない）
-            self.realtime_service.send_text(instruction)
-            # 会話履歴には追加しないでおく（あるいはシステムメッセージとして追加してもよい）
 
     def _start_ai_audio_stream(self) -> None:
         """AI音声のストリーミング再生を開始"""
@@ -2388,7 +2344,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                         # 音声再生中はタイマーを停止
                         if not is_playing_audio:
                             is_playing_audio = True
-                            self._stop_silence_timer()
+                            # self._stop_silence_timer()
 
                         # ストリームが存在し、アクティブな場合のみ書き込み
                         if self.ai_audio_stream is not None:
@@ -2455,7 +2411,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                             # 再生終了直後
                             is_playing_audio = False
                             # AIの発話終了時に無音検知タイマーを開始
-                            self._start_silence_timer()
+                            # self._start_silence_timer()
 
                         # バッファが空の場合は少し待機
                         time.sleep(0.01)
@@ -2566,7 +2522,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                 # 音声検出：RMS値が閾値以上の時、またはポストロール期間中は送信
                 if rms >= self.audio_threshold:
                     # ユーザーが話している場合はタイマーを停止
-                    self._stop_silence_timer()
+                    # self._stop_silence_timer()
 
                     # 発話状態をアクティブに設定
                     self.speech_active_state = True
@@ -2822,7 +2778,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
             # 会話テストの場合は音声送受信を一時停止
             if self.current_test_id == "conversation":
                 # 無音検知タイマーを停止
-                self._stop_silence_timer()
+                # self._stop_silence_timer()
 
                 # 音声ストリームは停止しない（接続を維持）
                 # audio_callback_24khzがtest_pausedフラグをチェックして送信を停止する
@@ -2860,12 +2816,6 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
 
         # 会話テストの場合はRealtime APIを切断
         if self.current_test_id == "conversation" and self.realtime_service:
-            # 無音検知タイマーを停止
-            self._stop_silence_timer()
-
-            self.conversation_running = False
-            # 録音を停止（会話セッション終了時）
-            self._stop_student_audio_monitoring()
             # 音声ストリームを停止
             self._stop_ai_audio_stream()
             # バッファキューをクリア
@@ -2980,7 +2930,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
             # 会話テストの場合はRealtime APIを切断して最終評価を実行
             if test_id == "conversation":
                 # 無音検知タイマーを停止
-                self._stop_silence_timer()
+                # self._stop_silence_timer()
 
                 # ステータステキストを「会話セッション終了」に更新（会話テストタブのみ）
                 if "conversation" in self.tab_status_texts:
@@ -3143,6 +3093,15 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
 
     def _transition_to_result_screen(self, result_data: dict[str, Any]) -> None:
         """結果画面へ遷移"""
+
+        # 結果画面への遷移時にタイマーを確実に停止する
+        # これを行わないと、結果画面表示中にタイマーが発火して再評価→ローディング表示が発生する場合がある
+        self.overall_timer_running = False
+        for timer_info in self.tab_timers.values():
+            timer_info["running"] = False
+
+        # 無音検知タイマーも停止
+        # self._stop_silence_timer()
 
         def on_back():
             # リソースのクリーンアップ
