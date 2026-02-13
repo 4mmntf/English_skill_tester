@@ -179,7 +179,15 @@ class RealtimeService:
                     for event in current_session:
                         self._handle_event(event)
             except Exception as e:
-                error_msg = f"Realtime APIイベントループエラー: {str(e)}"
+                error_str = str(e)
+                # "sent 1000 (OK); no close frame received" は正常終了時の警告のようなものなので
+                # エラーとして扱わず、ログ出力にとどめる
+                if "sent 1000 (OK)" in error_str:
+                    print(f"Realtime API接続終了: {error_str}")
+                    self.is_connected = False
+                    return
+
+                error_msg = f"Realtime APIイベントループエラー: {error_str}"
                 if self.on_error:
                     self.on_error(error_msg)
                 print(error_msg)

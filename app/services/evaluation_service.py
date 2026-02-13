@@ -76,7 +76,7 @@ class EvaluationService:
         grammar_results: list[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         """
-        TOEICスコア予測を実行
+        総合スコア予測を実行
 
         Args:
             conversation_text: 会話テキスト

@@ -157,6 +157,14 @@ class ConversationWindow:
             None  # 一時停止・中断ボタンの上に表示するステータステキスト
         )
 
+        self.last_ai_audio_time: float = 0.0  # 最後にAI音声を受信した時刻
+
+        self.ai_playback_thread: threading.Thread | None = None  # AI音声再生スレッド
+        self.ai_playback_thread_running: bool = False # スレッド実行中フラグ
+
+        self.is_ai_speaking: bool = False  # AIが発話中かどうか（エコーキャンセルのため）
+        self.ai_speaking_end_time: float = 0.0 # AI発話終了予定時刻
+
         # 会話テスト用のコンポーネント
         self.roleplay_dropdown: ft.Dropdown | None = (
             None  # ロールプレイ選択ドロップダウン
@@ -165,7 +173,7 @@ class ConversationWindow:
         self.student_waveform_chart: ft.LineChart | None = None  # 学生用の音声波形
         self.student_waveform_buffer: list[float] = []  # 学生用波形バッファ
         self.conversation_session_duration_minutes: int = (
-            1  # 会話セッションの時間（分） - 開発用に調整可能
+            3  # 会話セッションの時間（分） - 開発用に調整可能
         )
         self.conversation_running: bool = False  # 会話テスト実行中フラグ
         self.ai_audio_playing: bool = False  # 音声再生中フラグ
@@ -253,6 +261,9 @@ class ConversationWindow:
         # 履歴リストコンポーネント
         self.history_list: ft.ListView | None = None
 
+        # 画面がアクティブかどうかのフラグ（非同期処理からのUI更新制御用）
+        self.is_active: bool = True
+
     def _show_evaluating_overlay(self, message: str) -> None:
         """評価中のオーバーレイを表示（画面全体を覆って操作不能にする）"""
 
@@ -311,26 +322,37 @@ class ConversationWindow:
 
     def _hide_evaluating_overlay(self) -> None:
         """評価中のオーバーレイを非表示"""
-        if (
-            hasattr(self, "loading_overlay")
-            and self.loading_overlay in self.page.overlay
-        ):
-            self.page.overlay.remove(self.loading_overlay)
-            self.page.update()
-            # 参照を削除
-            del self.loading_overlay
-        elif self.page.overlay:
-            # フォールバック: loading_overlayが見つからないがoverlayがある場合
-            # 中身を確認してProgressRingが含まれていれば削除する（簡易的な判定）
-            for overlay in list(self.page.overlay):
-                if isinstance(overlay, ft.Container) and isinstance(
-                    overlay.content, ft.Column
-                ):
-                    if any(
-                        isinstance(c, ft.ProgressRing) for c in overlay.content.controls
+        try:
+            if (
+                hasattr(self, "loading_overlay")
+                and self.loading_overlay in self.page.overlay
+            ):
+                self.page.overlay.remove(self.loading_overlay)
+                self.page.update()
+                # 参照を削除
+                del self.loading_overlay
+            elif self.page.overlay:
+                # フォールバック: loading_overlayが見つからないがoverlayがある場合
+                # 中身を確認してProgressRingが含まれていれば削除する（簡易的な判定）
+                updated = False
+                for overlay in list(self.page.overlay):
+                    if isinstance(overlay, ft.Container) and isinstance(
+                        overlay.content, ft.Column
                     ):
-                        self.page.overlay.remove(overlay)
-            self.page.update()
+                        if any(
+                            isinstance(c, ft.ProgressRing) for c in overlay.content.controls
+                        ):
+                            self.page.overlay.remove(overlay)
+                            updated = True
+                
+                if updated:
+                    self.page.update()
+        except RuntimeError as e:
+            # イベントループが閉じている場合は無視する
+            if "Event loop is closed" not in str(e):
+                print(f"オーバーレイ非表示ランタイムエラー: {str(e)}")
+        except Exception as e:
+            print(f"オーバーレイ非表示エラー: {str(e)}")
 
     def _load_session_data(self) -> None:
         """指定されたセッションディレクトリからデータを復元"""
@@ -2054,7 +2076,7 @@ You have access to two tools:
 """
 
         # レベル適応に関する共通の指示
-        adaptive_instructions = """
+        adaptive_instructions = f"""
         **Adaptive Difficulty Instructions (CRITICAL):**
         You MUST constantly assess the user's English proficiency on a scale of 1-10 and adapt your behavior accordingly.
 
@@ -2072,6 +2094,14 @@ You have access to two tools:
             *   **Specific Vocabulary:** Use context-appropriate, specific vocabulary (not vague words).
             *   **Circumlocution Support:** If the user seems to forget a word or gets stuck, DO NOT stop the conversation. Instead, offer a helping word or paraphrase what they might mean (circumlocution) to keep the flow going.
             *   **Encourage Output:** If the user gives very short answers, ask open-ended follow-up questions to encourage them to speak more.
+
+        4.  **Time Management (CRITICAL):**
+            *   The session is strictly limited to approximately {self.conversation_session_duration_minutes} minutes.
+            *   You must manage the flow of the conversation to fit within this timeframe.
+            *   As the conversation progresses, be mindful of the time.
+            *   If you feel the conversation has been going on for a while (nearing the limit), start to summarize or wrap up the current topic naturally.
+            *   Do not abruptly cut off the user, but guide the conversation towards a conclusion so that when the hard limit hits, it feels less jarring.
+            *   However, do NOT constantly mention the time remaining unless it is part of the roleplay scenario (e.g. "We are running out of time for our lesson").
 
         **Noise Handling (CRITICAL):**
         If the user input is just noise, coughing, breathing, or very short unintelligible sounds, IGNORE it. 
@@ -2213,8 +2243,8 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
 
     def _on_ai_audio_received(self, audio_data: bytes) -> None:
         """AI音声データを受信したときの処理"""
-        # 一時停止中は音声を受信しない
-        if self.test_paused:
+        # 会話が終了している、または一時停止中は音声を受信しない
+        if not self.conversation_running or self.test_paused:
             return
 
         try:
@@ -2245,14 +2275,23 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
             # バッファキューに追加（途切れを防ぐため）
             with self.ai_audio_buffer_queue_lock:
                 self.ai_audio_buffer_queue.append(amplified)
+                self.last_ai_audio_time = time.time()  # 受信時刻を更新
 
             # 録音バッファに追加（保存用、会話セッション中のみ）
             if self.conversation_running:
                 with self.ai_audio_recording_lock:
                     self.ai_audio_recording_buffer.append(audio_array.copy())
 
-            # ストリーミング再生を開始（まだ開始していない場合）
+            # ストリーミング再生を開始（まだ開始していない、または停止している場合）
+            # 再生スレッドが死んでいる場合も再起動する
+            need_restart = False
             if self.ai_audio_stream is None:
+                need_restart = True
+            elif self.ai_playback_thread is None or not self.ai_playback_thread.is_alive():
+                 print("再生スレッドが停止しているため再起動します")
+                 need_restart = True
+            
+            if need_restart:
                 self._start_ai_audio_stream()
 
         except Exception as e:
@@ -2286,7 +2325,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                     samplerate=24000,
                     channels=1,
                     dtype=np.float32,
-                    blocksize=16384,  # バッファサイズを適切な値に設定（聞き取りやすさを優先）
+                    blocksize=4096,  # バッファサイズを小さくして応答性を向上
                     latency="high",  # 高レイテンシーで安定性を確保
                     device=device_index,
                 )
@@ -2307,118 +2346,145 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
 
         try:
             # バッファから音声を再生するスレッドを開始
+            self.ai_playback_thread_running = True
+            
             def playback_thread():
                 """バッファから音声を連続再生"""
                 is_playing_audio = False  # 音声再生中フラグ
+                
+                try:
+                    while (self.conversation_running or len(self.ai_audio_buffer_queue) > 0) and self.ai_playback_thread_running:
+                        # 一時停止中は再生しない
+                        if self.test_paused:
+                            time.sleep(0.1)
+                            continue
 
-                while self.conversation_running or len(self.ai_audio_buffer_queue) > 0:
-                    # 一時停止中は再生しない
-                    if self.test_paused:
-                        time.sleep(0.1)
-                        continue
+                        audio_chunk: NDArray[np.floating] | None = None
 
-                    audio_chunk: NDArray[np.floating] | None = None
+                        # バッファキューからデータを取得
+                        with self.ai_audio_buffer_queue_lock:
+                            # プレバッファリングロジック：再生開始時に一定量のデータが溜まるのを待つ
+                            if not is_playing_audio:
+                                buffer_count = len(self.ai_audio_buffer_queue)
+                                time_since_last_recv = time.time() - self.last_ai_audio_time
+                                
+                                # バッファが少ない、かつ、最後の受信からあまり時間が経っていない場合は待機
+                                # (データが継続的に来ている最中は、ある程度溜まるまで待つ)
+                                if buffer_count < 3 and time_since_last_recv < 0.2 and buffer_count > 0:
+                                    # まだデータが来る可能性が高いので待機
+                                    # print(f"Buffering... count={buffer_count}, time={time_since_last_recv:.3f}")
+                                    time.sleep(0.01)
+                                    continue
 
-                    # バッファキューからデータを取得
-                    with self.ai_audio_buffer_queue_lock:
-                        if len(self.ai_audio_buffer_queue) > 0:
-                            # 複数のチャンクを結合して、より大きなチャンクで再生
-                            chunks_to_combine: list[NDArray[np.floating]] = []
-                            total_samples = 0
+                            if len(self.ai_audio_buffer_queue) > 0:
+                                # 複数のチャンクを結合して、より大きなチャンクで再生
+                                chunks_to_combine: list[NDArray[np.floating]] = []
+                                total_samples = 0
 
-                            # 最大32768サンプル（約1.36秒）まで結合（適切なバッファサイズで聞き取りやすさを優先）
-                            while (
-                                len(self.ai_audio_buffer_queue) > 0
-                                and total_samples < 32768
-                            ):
-                                chunk: NDArray[np.floating] = (
-                                    self.ai_audio_buffer_queue.pop(0)
-                                )
-                                chunks_to_combine.append(chunk)
-                                total_samples += len(chunk)
-
-                            if chunks_to_combine:
-                                # チャンクを結合
-                                audio_chunk = np.concatenate(chunks_to_combine)
-
-                    if audio_chunk is not None and len(audio_chunk) > 0:
-                        # 音声再生中はタイマーを停止
-                        if not is_playing_audio:
-                            is_playing_audio = True
-                            # self._stop_silence_timer()
-
-                        # ストリームが存在し、アクティブな場合のみ書き込み
-                        if self.ai_audio_stream is not None:
-                            try:
-                                # 2次元配列に変換（shape: (samples, 1)）
-                                audio_2d = audio_chunk.reshape(-1, 1)
-                                self.ai_audio_stream.write(audio_2d)
-                            except Exception as e:
-                                error_msg = str(e)
-                                # PortAudioエラーの場合は、ストリームを再初期化
-                                if (
-                                    "PortAudio" in error_msg
-                                    or "PaErrorCode" in error_msg
+                                # 最大32768サンプル（約1.36秒）まで結合（適切なバッファサイズで聞き取りやすさを優先）
+                                while (
+                                    len(self.ai_audio_buffer_queue) > 0
+                                    and total_samples < 32768
                                 ):
-                                    try:
-                                        if self.ai_audio_stream is not None:
-                                            self.ai_audio_stream.stop()
-                                            self.ai_audio_stream.close()
-                                    except:
-                                        pass
-                                    self.ai_audio_stream = None
-                                    # ストリームを再初期化
-                                    time.sleep(0.1)
-
-                                    # 再初期化も同様に候補デバイスを試す
-                                    reinit_success = False
-                                    for dev_idx in candidate_devices:
-                                        try:
-                                            self.ai_audio_stream = sd.OutputStream(
-                                                samplerate=24000,
-                                                channels=1,
-                                                dtype=np.float32,
-                                                blocksize=16384,
-                                                latency="high",
-                                                device=dev_idx,
-                                            )
-                                            self.ai_audio_stream.start()
-                                            print(
-                                                f"音声ストリームを再初期化しました (Device: {dev_idx})"
-                                            )
-                                            reinit_success = True
-                                            break
-                                        except Exception:
-                                            continue
-
-                                    if not reinit_success:
-                                        print("音声ストリームの再初期化に失敗しました")
-                                        self.ai_audio_stream = None
-                                else:
-                                    # その他のエラーはログに出力（頻繁に出力しない）
-                                    pass
-                        else:
-                            # ストリームが存在しない場合は、バッファに戻す
-                            with self.ai_audio_buffer_queue_lock:
-                                # チャンクを分割してバッファに戻す（簡易実装）
-                                chunk_size = 1024
-                                for i in range(0, len(audio_chunk), chunk_size):
-                                    self.ai_audio_buffer_queue.insert(
-                                        0, audio_chunk[i : i + chunk_size]
+                                    chunk: NDArray[np.floating] = (
+                                        self.ai_audio_buffer_queue.pop(0)
                                     )
-                    else:
-                        # バッファが空になった場合
-                        if is_playing_audio:
-                            # 再生終了直後
-                            is_playing_audio = False
-                            # AIの発話終了時に無音検知タイマーを開始
-                            # self._start_silence_timer()
+                                    chunks_to_combine.append(chunk)
+                                    total_samples += len(chunk)
 
-                        # バッファが空の場合は少し待機
-                        time.sleep(0.01)
+                                if chunks_to_combine:
+                                    # チャンクを結合
+                                    audio_chunk = np.concatenate(chunks_to_combine)
 
-            playback_thread_obj = threading.Thread(target=playback_thread, daemon=True)
-            playback_thread_obj.start()
+                        if audio_chunk is not None and len(audio_chunk) > 0:
+                            # 音声再生中はタイマーを停止
+                            if not is_playing_audio:
+                                is_playing_audio = True
+                                self.is_ai_speaking = True  # 発話開始フラグ
+                                # self._stop_silence_timer()
+
+                            # ストリームが存在し、アクティブな場合のみ書き込み
+                            if self.ai_audio_stream is not None:
+                                try:
+                                    # 2次元配列に変換（shape: (samples, 1)）
+                                    audio_2d = audio_chunk.reshape(-1, 1)
+                                    self.ai_audio_stream.write(audio_2d)
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    # PortAudioエラーの場合は、ストリームを再初期化
+                                    if (
+                                        "PortAudio" in error_msg
+                                        or "PaErrorCode" in error_msg
+                                    ):
+                                        try:
+                                            if self.ai_audio_stream is not None:
+                                                self.ai_audio_stream.stop()
+                                                self.ai_audio_stream.close()
+                                        except:
+                                            pass
+                                        self.ai_audio_stream = None
+                                        # ストリームを再初期化
+                                        time.sleep(0.1)
+
+                                        # 再初期化も同様に候補デバイスを試す
+                                        reinit_success = False
+                                        for dev_idx in candidate_devices:
+                                            try:
+                                                self.ai_audio_stream = sd.OutputStream(
+                                                    samplerate=24000,
+                                                    channels=1,
+                                                    dtype=np.float32,
+                                                    blocksize=4096,
+                                                    latency="high",
+                                                    device=dev_idx,
+                                                )
+                                                self.ai_audio_stream.start()
+                                                print(
+                                                    f"音声ストリームを再初期化しました (Device: {dev_idx})"
+                                                )
+                                                reinit_success = True
+                                                break
+                                            except Exception:
+                                                continue
+
+                                        if not reinit_success:
+                                            print("音声ストリームの再初期化に失敗しました")
+                                            self.ai_audio_stream = None
+                                    else:
+                                        # その他のエラーはログに出力（頻繁に出力しない）
+                                        print(f"音声書き込みエラー（再試行せず）: {e}")
+                                        pass
+                            else:
+                                # ストリームが存在しない場合は、バッファに戻す
+                                with self.ai_audio_buffer_queue_lock:
+                                    # チャンクを分割してバッファに戻す（簡易実装）
+                                    chunk_size = 1024
+                                    for i in range(0, len(audio_chunk), chunk_size):
+                                        self.ai_audio_buffer_queue.insert(
+                                            0, audio_chunk[i : i + chunk_size]
+                                        )
+                        else:
+                            # バッファが空になった場合
+                            if is_playing_audio:
+                                # 再生終了直後
+                                is_playing_audio = False
+                                
+                                # ポストロール待機（エコーキャンセルのため少し待つ）
+                                time.sleep(0.3) 
+                                self.is_ai_speaking = False # 発話終了フラグ
+                                
+                                # AIの発話終了時に無音検知タイマーを開始
+                                # self._start_silence_timer()
+
+                            # バッファが空の場合は少し待機
+                            time.sleep(0.01)
+                            
+                except Exception as e:
+                    print(f"再生スレッドで致命的なエラーが発生: {e}")
+                    # スレッド終了
+
+            self.ai_playback_thread = threading.Thread(target=playback_thread, daemon=True)
+            self.ai_playback_thread.start()
 
         except Exception as e:
             print(f"音声ストリーム開始エラー: {str(e)}")
@@ -2469,6 +2535,11 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                 or not self.realtime_service
                 or self.test_paused
             ):
+                return
+            
+            # エコーキャンセル：AIが発話中、または発話終了直後はマイク入力を無視
+            # スピーカーからの音がマイクに入り、それが「ユーザーの発話」として誤検知されるのを防ぐ
+            if self.is_ai_speaking:
                 return
 
             try:
@@ -2817,16 +2888,25 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
 
         # 会話テストの場合はRealtime APIを切断
         if self.current_test_id == "conversation" and self.realtime_service:
-            # 音声ストリームを停止
-            self._stop_ai_audio_stream()
-            # バッファキューをクリア
-            with self.ai_audio_buffer_queue_lock:
-                self.ai_audio_buffer_queue.clear()
-            # 少し待機して再生が完了するのを待つ
-            time.sleep(0.5)
+            # フラグを落とす
+            self.conversation_running = False
+
+            # 1. Realtime APIを切断（先に切断してイベント受信を停止）
             self.realtime_service.disconnect()
             self.realtime_service = None
+
+            # 2. マイク監視を停止
             self.audio_service.stop_mic_monitoring()
+
+            # 3. バッファキューをクリア
+            with self.ai_audio_buffer_queue_lock:
+                self.ai_audio_buffer_queue.clear()
+            
+            # 4. 再生スレッドの終了を待つ
+            time.sleep(0.5)
+
+            # 5. 音声ストリームを停止
+            self._stop_ai_audio_stream()
 
             # 会話終了後に最終評価を実行（最終評価のみ表示）
             if len(self.conversation_history) > 0:
@@ -2942,24 +3022,26 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
 
                 if self.realtime_service:
                     self.conversation_running = False
-                    # 録音を停止（会話セッション終了時）
-                    self._stop_student_audio_monitoring()
 
-                    # 音声再生スレッドを先に停止させるためにバッファをクリア
+                    # 1. Realtime APIを切断（先に切断してイベント受信を停止）
+                    self.realtime_service.disconnect()
+                    self.realtime_service = None
+
+                    # 2. 録音を停止（会話セッション終了時）
+                    self._stop_student_audio_monitoring()
+                    self.audio_service.stop_mic_monitoring()
+
+                    # 3. 音声再生スレッドを先に停止させるためにバッファをクリア
                     # スレッドは conversation_running=False かつ buffer空 で終了する
                     with self.ai_audio_buffer_queue_lock:
                         self.ai_audio_buffer_queue.clear()
 
-                    # 再生スレッドが終了するのを少し待つ
+                    # 4. 再生スレッドが終了するのを少し待つ
                     # ストリームを先に閉じてしまうと、スレッドが書き込みに行こうとしてエラーになる可能性がある
                     time.sleep(0.5)
 
-                    # その後に音声ストリームを停止
+                    # 5. その後に音声ストリームを停止
                     self._stop_ai_audio_stream()
-
-                    self.realtime_service.disconnect()
-                    self.realtime_service = None
-                    self.audio_service.stop_mic_monitoring()
 
             # 会話履歴がなくても評価フローに進む（空の場合は0点として処理される）
             if test_id == "conversation":
@@ -3096,6 +3178,13 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
     def _transition_to_result_screen(self, result_data: dict[str, Any]) -> None:
         """結果画面へ遷移"""
 
+        # 画面遷移開始フラグを設定（非同期処理からのUI更新を防止）
+        self.is_active = False
+
+        # オーバーレイが表示されている場合は削除
+        self.page.overlay.clear()
+        self.page.update()
+
         # 結果画面への遷移時にタイマーを確実に停止する
         # これを行わないと、結果画面表示中にタイマーが発火して再評価→ローディング表示が発生する場合がある
         self.overall_timer_running = False
@@ -3159,10 +3248,19 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
         Args:
             is_final: 最終評価の場合True（ステータステキストに表示する）
         """
+        # 重複実行防止
+        if getattr(self, "_is_evaluating", False):
+            print("評価プロセスは既に実行中です。")
+            return
+        self._is_evaluating = True
 
         async def evaluate_async():
             """評価を非同期で実行"""
             try:
+                # 画面がアクティブでない場合は中断
+                if not self.is_active:
+                    return
+
                 # 評価開始を表示
                 # print("評価プロセスを開始しました")
                 if "conversation" in self.tab_status_texts:
@@ -3235,17 +3333,21 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                         # print(f"全テスト完了状態: {all_completed}")
 
                         if all_completed:
+                            # 画面がアクティブでない場合は中断
+                            if not self.is_active:
+                                return
+
                             # 評価中のオーバーレイを表示
                             # メインスレッドで実行する必要があるため、少しハッキーだが非同期関数内から同期的に呼び出す
                             # UI更新はメインスレッドで行われる
                             self._show_evaluating_overlay("総合スコアを判定中...")
 
                             try:
-                                # TOEICスコア予測の計算 (GPT-5による予測)
-                                # print("TOEICスコア予測を実行中...")
+                                # 総合スコアの計算 (GPT-5による予測)
+                                # print("総合スコアを実行中...")
                                 # タイムアウト設定を追加（60秒）
                                 predicted_result = await asyncio.wait_for(
-                                    self.evaluation_service.predict_toeic_score(
+                                    self.evaluation_service.predict_total_score(
                                         conversation_text,
                                         self.listening_results,
                                         self.grammar_results,
@@ -3286,7 +3388,8 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
                                 "feedback": feedback,
                             }
                             # print("結果画面へ遷移します（総合スコアあり）")
-                            self._transition_to_result_screen(result_data)
+                            if self.is_active:
+                                self._transition_to_result_screen(result_data)
 
                             # データを非同期で保存（UIをブロックしない）
                             # print("データを保存中...")
@@ -3346,6 +3449,7 @@ The conversation lasts about {self.conversation_session_duration_minutes} minute
             finally:
                 # 念のためオーバーレイを消す（もし残っていたら）
                 self._hide_evaluating_overlay()
+                self._is_evaluating = False
 
         # 評価を非同期で実行（音声処理をブロックしない）
         # 既存のイベントループがある場合はタスクとしてスケジュール、ない場合は別スレッドで新しいループを実行
@@ -3672,17 +3776,26 @@ Please respond in JSON format:
             print(f"会話データを保存しました: {json_path}")
 
             # ステータステキストに保存パスを表示（会話テストタブのみ）
-            save_message = f"会話データを保存しました: {json_path}"
-            if "conversation" in self.tab_status_texts:
-                status_text = self.tab_status_texts["conversation"]
-                # 「会話セッション終了」の次の行に保存パスを表示
-                if status_text.value == "会話セッション終了":
-                    status_text.value = f"会話セッション終了\n{save_message}"
+            try:
+                save_message = f"会話データを保存しました: {json_path}"
+                if "conversation" in self.tab_status_texts:
+                    status_text = self.tab_status_texts["conversation"]
+                    # 「会話セッション終了」の次の行に保存パスを表示
+                    if status_text.value == "会話セッション終了":
+                        status_text.value = f"会話セッション終了\n{save_message}"
+                    else:
+                        status_text.value = f"{status_text.value}\n{save_message}"
+                    status_text.color = ft.colors.GREY_700
+                    # UIを更新
+                    self.page.update()
+            except RuntimeError as e:
+                # イベントループが閉じている場合は無視する（アプリ終了時など）
+                if "Event loop is closed" in str(e):
+                    print("UI更新スキップ: イベントループが閉じられています")
                 else:
-                    status_text.value = f"{status_text.value}\n{save_message}"
-                status_text.color = ft.colors.GREY_700
-                # UIを更新
-                self.page.update()
+                    print(f"UI更新ランタイムエラー: {str(e)}")
+            except Exception as e:
+                print(f"UI更新エラー: {str(e)}")
 
         except Exception as e:
             print(f"会話データの保存エラー: {str(e)}")
@@ -4196,13 +4309,13 @@ Please respond in JSON format:
                 )
             )
 
-            # 結果を非同期で保存
-            asyncio.create_task(self._save_listening_data_async())
+            # 結果を同期的に保存
+            self._save_listening_data()
 
             self.page.update()
 
-    async def _save_listening_data_async(self) -> None:
-        """リスニングテストの結果を非同期で保存"""
+    def _save_listening_data(self) -> None:
+        """リスニングテストの結果を同期的に保存"""
         try:
             # 統合されたセッションディレクトリを取得
             save_dir = self._get_or_create_session_dir()
@@ -4228,8 +4341,8 @@ Please respond in JSON format:
             # JSONファイルを保存
             json_path = save_dir / f"{base_filename}.json"
             json_str = json.dumps(json_data, ensure_ascii=False, indent=2)
-            async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
-                await f.write(json_str)
+            with open(json_path, "w", encoding="utf-8") as f:
+                f.write(json_str)
 
             print(f"リスニングテストの結果を保存しました: {json_path}")
 
@@ -4239,27 +4352,38 @@ Please respond in JSON format:
 
     def _on_listening_finish_clicked(self, e: ft.ControlEvent) -> None:
         """リスニングテスト終了ボタンクリック時の処理"""
-        # テスト完了フラグを設定
-        self.listening_test_completed = True
+        # ボタンを無効化して多重クリックを防止
+        e.control.disabled = True
+        e.control.update()
 
-        # タイマーを停止
-        self._stop_test_timer("listening")
+        try:
+            # テスト完了フラグを設定
+            self.listening_test_completed = True
 
-        # すべてのテストが完了しているかチェック（会話、リスニング、文法）
-        if self._check_all_tests_completed():
-            # 総合評価（TOEIC予測）を実行して結果画面へ遷移
-            self._evaluate_conversation_async(is_final=True)
-        else:
-            # リスニングテストの結果データを構築
-            result_data = {
-                "listening_score": self.listening_score,
-                "listening_question_count": self.listening_question_count,
-                "listening_results": self.listening_results,
-                "listening_passages": self.listening_problems,  # 問題文データも渡す
-            }
+            # タイマーを停止
+            self._stop_test_timer("listening")
 
-            # 結果画面へ遷移
-            self._transition_to_result_screen(result_data)
+            # すべてのテストが完了しているかチェック（会話、リスニング、文法）
+            if self._check_all_tests_completed():
+                # 総合評価を実行して結果画面へ遷移
+                self._evaluate_conversation_async(is_final=True)
+            else:
+                # リスニングテストの結果データを構築
+                result_data = {
+                    "listening_score": self.listening_score,
+                    "listening_question_count": self.listening_question_count,
+                    "listening_results": self.listening_results,
+                    "listening_passages": self.listening_problems,  # 問題文データも渡す
+                }
+
+                # 結果画面へ遷移
+                self._transition_to_result_screen(result_data)
+        except Exception as ex:
+            print(f"リスニング終了処理エラー: {ex}")
+            traceback.print_exc()
+            self.listening_status_text.value = f"エラーが発生しました: {ex}"
+            self.listening_status_text.color = ft.colors.RED
+            self.page.update()
 
     def _create_grammar_test_content(self) -> ft.Container:
         """文法テストタブのコンテンツを作成"""

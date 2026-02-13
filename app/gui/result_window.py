@@ -58,7 +58,7 @@ class ResultWindow:
                 "timestamp": datetime.now().isoformat(),
                 "predicted_total": self.result_data.get("predicted_total_score"),
                 "listening_score": self.result_data.get("listening_score"),
-                "reading_score": self.result_data.get("reading_score"),  # TOEIC予測から
+                "reading_score": self.result_data.get("reading_score"),  # 総合スコアから
                 "conversation_level": self._extract_level(
                     self.result_data.get("feedback", "")
                 ),
@@ -628,21 +628,21 @@ class ResultWindow:
 
         rows = []
 
-        # TOEIC予測スコア表示（存在する場合）
-        predicted_toeic = self.result_data.get("predicted_total_score")
-        if predicted_toeic is not None:
+        # 総合スコア表示（存在する場合）
+        predicted_total_score = self.result_data.get("predicted_total_score")
+        if predicted_total_score is not None:
             rows.append(
                 ft.Container(
                     content=ft.Row(
                         [
                             ft.Text(
-                                "TOEIC予測",
+                                "総合スコア",
                                 size=18,
                                 weight=ft.FontWeight.BOLD,
                                 width=100,
                             ),
                             ft.ProgressBar(
-                                value=predicted_toeic / 990,
+                                value=predicted_total_score / 1000,
                                 color=ft.colors.INDIGO,
                                 bgcolor=ft.colors.GREY_100,
                                 expand=True,
@@ -650,7 +650,7 @@ class ResultWindow:
                             ),
                             ft.Container(width=10),
                             ft.Text(
-                                f"{predicted_toeic}",
+                                f"{predicted_total_score}",
                                 size=18,
                                 weight=ft.FontWeight.BOLD,
                                 width=60,
